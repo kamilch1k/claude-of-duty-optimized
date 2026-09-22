@@ -1,0 +1,203 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>bake — world</title>
+  </head>
+  <body style="margin: 0; background: #000">
+    <div id="c"></div>
+    <script type="module">
+      /**
+       * World bake page.
+       *
+       * The level is built by a subsystem that expects an engine around it, but
+       * it only reaches for four things — a scene, an rng, the materials system
+       * and a config — and it null-guards the two it does not strictly need
+       * (physics and render). So it can be stood up here on a stub context and
+       * asked to build itself, which is far more robust than reimplementing
+       * dressing.js.
+       *
+       * Everything that comes out is merged per material, instances included:
+       * the street has several hundred instanced props and a prefab with one
+       * GameObject per crate would be unusable in the editor.
+       */
+      import * as THREE from 'three';
+      import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+      import { MaterialSystem } from '/src/materials/index.js';
+      import { WorldSystem } from '/src/world/index.js';
+      import { Rng } from '/src/core/rng.js';
+
+      const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
+      renderer.setSize(512, 512);
+      document.getElementById('c').appendChild(renderer.domElement);
+
+      const materials = new MaterialSystem({ renderer });
+      await materials.init({ config: { quality: 'ultra', q: { anisotropy: 16 } } });
+
+      function toB64(bytes) {
+        let s = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+          s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(s);
+      }
+
+      const sanitize = (name) => String(name || 'part').replace(/[^A-Za-z0-9_]/g, '_');
+
+      /** Strip to position/normal/color + index: the shader needs nothing else. */
+      function normalize(geo, color) {
+        const g = geo.index ? geo : geo.clone();
+        if (!geo.index) {
+          const n = geo.getAttribute('position').count;
+          const idx = new Uint32Array(n);
+          for (let i = 0; i < n; i++) idx[i] = i;
+          g.setIndex(new THREE.BufferAttribute(idx, 1));
+        }
+        for (const name of Object.keys(g.attributes)) {
+          if (!['position', 'normal', 'color'].includes(name)) g.deleteAttribute(name);
+        }
+        if (!g.getAttribute('normal')) g.computeVertexNormals();
+        if (!g.getAttribute('color')) {
+          const n = g.getAttribute('position').count;
+          const c = new Float32Array(n * 3).fill(color ?? 1);
+          g.setAttribute('color', new THREE.BufferAttribute(c, 3));
+        }
+        g.morphAttributes = {};
+        g.clearGroups();
+        return g;
+      }
+
+      async function bakeWorld(mapId, { maxTris = 0 } = {}) {
+        const scene = new THREE.Scene();
+        const ctx = {
+          scene,
+          rng: new Rng(0xc0ffee),
+          config: { map: mapId, quality: 'ultra', q: { anisotropy: 16 } },
+          get: (id) => (id === 'materials' ? materials : null),
+          peek: () => null,
+        };
+        const t0 = performance.now();
+        const world = new WorldSystem();
+        await world.init(ctx);
+        const buildMs = performance.now() - t0;
+
+        world.root.updateMatrixWorld(true);
+
+        // Material objects are cached by key in the material system, so identity
+        // is the reliable way back from a mesh to the surface it wants.
+        const byUuid = new Map();
+        for (const [key, mat] of materials._materials) byUuid.set(mat.uuid, key);
+        const keyOf = (mat) => {
+          const list = Array.isArray(mat) ? mat : [mat];
+          for (const m of list) {
+            const key = byUuid.get(m?.uuid);
+            if (key) return key;
+            if (m?.name && materials.names().includes(m.name)) return m.name;
+          }
+          return list[0]?.name || 'concrete';
+        };
+
+        // Merge everything per material: instances included, matrices baked in.
+        const buckets = new Map();
+        const matrix = new THREE.Matrix4();
+        let meshes = 0;
+        let instances = 0;
+
+        world.root.traverse((o) => {
+          const push = (geo, m) => {
+            const key = keyOf(o.material);
+            if (!buckets.has(key)) buckets.set(key, []);
+            buckets.get(key).push(normalize(geo.clone().applyMatrix4(m)));
+          };
+          if (o.isInstancedMesh) {
+            meshes++;
+            for (let i = 0; i < o.count; i++) {
+              o.getMatrixAt(i, matrix);
+              matrix.premultiply(o.matrixWorld);
+              push(o.geometry, matrix);
+              instances++;
+            }
+          } else if (o.isMesh) {
+            meshes++;
+            push(o.geometry, o.matrixWorld);
+          }
+        });
+
+        const chunks = [];
+        let offset = 0;
+        const pushBuffer = (typed) => {
+          const bytes = new Uint8Array(typed.buffer, typed.byteOffset, typed.byteLength);
+          const at = offset;
+          chunks.push(bytes);
+          offset += bytes.byteLength;
+          const pad = (4 - (offset % 4)) % 4;
+          if (pad) {
+            chunks.push(new Uint8Array(pad));
+            offset += pad;
+          }
+          return { offset: at, length: bytes.byteLength };
+        };
+
+        const parts = [];
+        let tris = 0;
+        for (const [key, list] of buckets) {
+          const merged = list.length === 1 ? list[0] : mergeGeometries(list, false);
+          if (!merged) continue;
+          for (const g of list) if (g !== merged) g.dispose();
+
+          const pos = merged.getAttribute('position');
+          const nrm = merged.getAttribute('normal');
+          const col = merged.getAttribute('color');
+          const idx = merged.getIndex();
+          const mesh = {
+            material: key,
+            vertexCount: pos.count,
+            indexCount: idx.count,
+            tris: idx.count / 3,
+            position: pushBuffer(pos.array),
+            normal: pushBuffer(nrm.array),
+            color: pushBuffer(col.array),
+            index: pushBuffer(idx.array),
+          };
+          tris += mesh.tris;
+          parts.push({ path: `world_${sanitize(key)}`, node: `world_${sanitize(key)}`, meshes: [mesh], nodes: [] });
+        }
+
+        if (maxTris && tris > maxTris) {
+          return { mapId, dry: true, tris, meshes, instances, parts: parts.length, buildMs };
+        }
+
+        const total = chunks.reduce((a, c) => a + c.byteLength, 0);
+        const bin = new Uint8Array(total);
+        let at = 0;
+        for (const c of chunks) {
+          bin.set(c, at);
+          at += c.byteLength;
+        }
+
+        const usedKeys = parts.map((p) => p.meshes[0].material);
+        const manifest = {
+          format: 'codm/1',
+          kind: 'world',
+          id: mapId,
+          label: mapId,
+          tris,
+          parts,
+          rootNodes: [],
+          specs: { meshes, instances, buildMs, bounds: world.bounds ? {
+            min: world.bounds.min.toArray(),
+            max: world.bounds.max.toArray(),
+          } : null, spawnPoints: (world.spawnPoints ?? []).map((s) => ({
+            position: s.position.toArray(), yaw: s.yaw, tag: s.tag,
+          })) },
+          materialDefs: Object.fromEntries(usedKeys.map((k) => [k, { source: k, params: null }])),
+          binBytes: total,
+        };
+        return { manifest, bin: toB64(bin), tris, meshes, instances, parts: parts.length, buildMs };
+      }
+
+      window.__BAKE__ = { bakeWorld };
+      window.__READY__ = true;
+    </script>
+  </body>
+</html>
