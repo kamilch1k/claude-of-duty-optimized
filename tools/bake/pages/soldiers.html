@@ -20,6 +20,7 @@
       import { Rng } from '/src/core/rng.js';
       import { buildSoldier, VARIANTS, MATERIAL_SLOTS } from '/src/ai/soldier.js';
       import { SoldierMaterials } from '/src/ai/textures.js';
+      import { RIG } from '/src/ai/rig.js';
 
       const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
       renderer.setSize(256, 256);
@@ -104,6 +105,27 @@
         const pos = geo.getAttribute('position');
         const nrm = geo.getAttribute('normal');
         const col = geo.getAttribute('color');
+        // CharacterBuilder writes real skin weights against the rig's bind-pose
+        // segments, which is what lets the port animate instead of sliding a
+        // mannequin around. Exported as-is: u16 bone indices, f32 weights.
+        const skinIndex = geo.getAttribute('skinIndex');
+        const skinWeight = geo.getAttribute('skinWeight');
+
+        /**
+         * The skeleton itself, from rig.js: names, parents and both the local and
+         * bind-pose transforms. Unity rebuilds the hierarchy from this, so the
+         * port never retypes a bone table.
+         */
+        const rig = {
+          bones: RIG.names.map((name, i) => ({
+            name,
+            parent: RIG.parent[i],
+            localPos: RIG.localPos[i].toArray(),
+            localQuat: RIG.localQuat[i].toArray(),
+            bindPos: RIG.bindPos[i].toArray(),
+            bindQuat: RIG.bindQuat[i].toArray(),
+          })),
+        };
 
         // One CODM mesh per material group: the importer turns those into
         // submeshes, which is how the soldier keeps its slots.
@@ -125,6 +147,14 @@
             position: push(pos.array),
             normal: push(nrm ? nrm.array : pos.array),
             color: push(col ? col.array : new Float32Array(pos.count * 3).fill(1)),
+            skinIndex: push(
+              skinIndex ? new Uint16Array(skinIndex.array.buffer, skinIndex.array.byteOffset, skinIndex.array.length)
+                        : new Uint16Array(pos.count * 4)
+            ),
+            skinWeight: push(
+              skinWeight ? new Float32Array(skinWeight.array.buffer, skinWeight.array.byteOffset, skinWeight.array.length)
+                         : new Float32Array(pos.count * 4)
+            ),
             index: push(sub),
           };
           tris += mesh.tris;
@@ -154,6 +184,7 @@
             tris,
             parts: [{ path: 'body', node: 'body', meshes, nodes: [] }],
             rootNodes: [],
+            rig,
             specs: { slots: MATERIAL_SLOTS, stats: built.stats ?? null },
             materialDefs: Object.fromEntries(meshes.map((m) => [m.material, { source: m.material, params: null }])),
             binBytes: total,
