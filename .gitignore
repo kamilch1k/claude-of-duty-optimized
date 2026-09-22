@@ -15,3 +15,6 @@ demo/
 .tmp-rend/
 revcrops/
 dist-portal/
+
+# Bake output — regenerate with tools/bake/*.mjs.
+tools/bake/out/

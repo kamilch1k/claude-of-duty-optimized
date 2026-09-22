@@ -1,0 +1,425 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>bake — meshes</title>
+  </head>
+  <body style="margin: 0; background: #000">
+    <div id="c"></div>
+    <script type="module">
+      /**
+       * Mesh bake page.
+       *
+       * Weapon geometry is built in code and never serialised, so this walks the
+       * model the viewmodel builds, buckets each assembly by material, keeps the
+       * attachment hierarchy and named nodes, and writes one GLB per weapon.
+       *
+       * Two things are deliberate:
+       *
+       *  - Material names are the game's own keys (`alu`, `steel_bright`, …).
+       *    The GLB carries placeholder PBR values because the real surfaces are
+       *    procedural tiles the Unity side rebuilds from `Textures/`. Matching on
+       *    the name is what lets it wire them back up.
+       *  - Geometry has no usable UVs — `normalizeAttributes` stubs them at zero
+       *    and the shader projects triplanar in object space. So the Unity
+       *    materials sample the baked tiles triplanar too, using each surface's
+       *    metres-per-tile. Do not "fix" the UVs here; it would double up with
+       *    the projection and stretch every surface.
+       */
+      import * as THREE from 'three';
+      import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
+      import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+      import { buildRifle } from '/src/weapons/models/rifle.js';
+      import { buildSmg } from '/src/weapons/models/smg.js';
+      import { buildPistol } from '/src/weapons/models/pistol.js';
+      import { triCount } from '/src/weapons/geometry.js';
+      import { WEAPON_MATERIALS } from '/src/weapons/materials.js';
+      import { bakeMasks } from '/src/materials/masks.js';
+
+      const BUILDERS = { rifle: buildRifle, smg: buildSmg, pistol: buildPistol };
+
+      const isAssembly = (v) => v && typeof v === 'object' && typeof v.build === 'function' && v.buckets;
+      const isGeometry = (v) => v && typeof v === 'object' && v.isBufferGeometry === true;
+
+      const matCache = new Map();
+      function materialFor(key) {
+        let m = matCache.get(key);
+        if (m) return m;
+        const metal = /steel|brass|copper/.test(key);
+        m = new THREE.MeshStandardMaterial({
+          name: key,
+          color: metal ? 0x9a9a9a : 0x2a2a2a,
+          metalness: metal ? 1 : key === 'alu' || key === 'alu_fine' ? 0.35 : 0,
+          roughness: metal ? 0.35 : 0.7,
+        });
+        matCache.set(key, m);
+        return m;
+      }
+
+      /** Every Assembly in a model, keyed by its path through the object graph. */
+      const nodeName = (path) => path.replace(/\//g, '__');
+
+      function collect(model) {
+        const found = [];
+        const specs = {};
+        const walk = (v, path) => {
+          if (v == null) return;
+          if (isAssembly(v)) {
+            found.push({ path, asm: v });
+            return;
+          }
+          if (isGeometry(v)) {
+            found.push({ path, geo: v });
+            return;
+          }
+          if (Array.isArray(v)) {
+            if (v.every((x) => typeof x === 'number')) specs[path] = v;
+            return;
+          }
+          if (typeof v === 'function' || typeof v !== 'object') {
+            if (v !== undefined && path) specs[path] = v;
+            return;
+          }
+          for (const [k, x] of Object.entries(v)) walk(x, path ? `${path}/${k}` : k);
+        };
+        for (const [k, v] of Object.entries(model)) {
+          if (k === 'nodes') continue;
+          walk(v, k);
+        }
+        if (model.nodes) {
+          for (const [n, v] of Object.entries(model.nodes)) {
+            const s = sanitizeParams(v);
+            if (s !== undefined) specs[`nodes/${n}`] = s;
+          }
+        }
+        return { found, specs };
+      }
+
+      function toB64(buf) {
+        const bytes = new Uint8Array(buf);
+        let s = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+          s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(s);
+      }
+
+      /** Flatten a material option bag to the JSON-safe scalars Unity can use. */
+      function sanitizeParams(v, depth = 0) {
+        if (depth > 4 || v == null) return undefined;
+        const t = typeof v;
+        if (t === 'number' || t === 'string' || t === 'boolean') return v;
+        if (Array.isArray(v)) {
+          const a = v.map((x) => sanitizeParams(x, depth + 1)).filter((x) => x !== undefined);
+          return a.length ? a : undefined;
+        }
+        if (t === 'object') {
+          if (v.isColor) return '#' + v.getHexString();
+          if (v.isVector4 || v.isVector2) return v.toArray();
+          const o = {};
+          for (const [k, x] of Object.entries(v)) {
+            if (k === 'three' || k === 'bake') continue;
+            const s = sanitizeParams(x, depth + 1);
+            if (s !== undefined) o[k] = s;
+          }
+          return Object.keys(o).length ? o : undefined;
+        }
+        return undefined;
+      }
+
+      /** Bake one weapon model to a GLB hierarchy plus its gameplay spec table. */
+      async function bakeModel(id) {
+        const builder = BUILDERS[id];
+        if (!builder) throw new Error(`unknown model "${id}"`);
+        const model = builder();
+        const { found, specs } = collect(model);
+        const root = new THREE.Object3D();
+        root.name = id;
+        const parts = [];
+        let tris = 0;
+
+        for (const { path, asm, geo } of found) {
+          const group = new THREE.Object3D();
+          group.name = nodeName(path);
+          if (geo) {
+            const mesh = new THREE.Mesh(geo, materialFor('glass'));
+            mesh.name = `${nodeName(path)}__glass`;
+            group.add(mesh);
+            tris += triCount(geo);
+            parts.push({ path, node: nodeName(path), materials: ['glass'], tris: triCount(geo) });
+          } else {
+            const buckets = asm.build();
+            const mats = [];
+            let sub = 0;
+            for (const [matKey, g] of buckets) {
+              const mesh = new THREE.Mesh(g, materialFor(matKey));
+              mesh.name = `${nodeName(path)}__${matKey}`;
+              group.add(mesh);
+              mats.push(matKey);
+              sub += triCount(g);
+            }
+            tris += sub;
+            parts.push({ path, node: nodeName(path), materials: mats, tris: sub });
+            for (const [n, t] of asm.nodes ?? []) {
+              const o = new THREE.Object3D();
+              o.name = `node_${n}`;
+              o.position.set(t.pos[0], t.pos[1], t.pos[2]);
+              o.rotation.set(t.rot[0], t.rot[1], t.rot[2], 'XYZ');
+              group.add(o);
+            }
+          }
+          root.add(group);
+        }
+
+        if (model.nodes) {
+          for (const [n, p] of Object.entries(model.nodes)) {
+            if (!Array.isArray(p)) continue;
+            const o = new THREE.Object3D();
+            o.name = `node_${n}`;
+            o.position.set(p[0], p[1], p[2]);
+            root.add(o);
+          }
+        }
+
+        const glb = await new Promise((res, rej) =>
+          new GLTFExporter().parse(root, res, rej, { binary: true, onlyVisible: false })
+        );
+        // Which baked texture set each material key resolves to, so the Unity
+        // material builder does not have to re-derive it from source.
+        const used = new Set(parts.flatMap((p) => p.materials));
+        const materialDefs = {};
+        for (const key of used) {
+          const def = WEAPON_MATERIALS[key];
+          materialDefs[key] = def
+            ? { source: def[0], params: sanitizeParams(def[1]) }
+            : { source: key, params: null };
+        }
+        return {
+          id,
+          label: model.label ?? id,
+          fxClass: model.fxClass ?? null,
+          tris,
+          parts,
+          specs,
+          materialDefs,
+          bytes: glb.byteLength,
+          glb: toB64(glb),
+        };
+      }
+
+      /**
+       * Round-trip check: load the exported GLB back and render it.
+       *
+       * An export can be lossy in ways a triangle count never shows — wrong axis
+       * convention, dropped hierarchy, a material name that did not survive — so
+       * the baker renders what it actually wrote.
+       */
+      const previewRenderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+      previewRenderer.setSize(900, 640);
+      previewRenderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      async function render(glbB64, { yaw = 0.72, pitch = 0.34, zoom = 1.06, roll = 0, hide = [] } = {}) {
+        const bytes = Uint8Array.from(atob(glbB64), (c) => c.charCodeAt(0));
+        const gltf = await new Promise((res, rej) =>
+          new GLTFLoader().parse(bytes.buffer, '', res, rej)
+        );
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x14161a);
+        scene.add(gltf.scene);
+        scene.add(new THREE.HemisphereLight(0xbdd4ff, 0x2a2620, 1.6));
+        const key = new THREE.DirectionalLight(0xffffff, 2.2);
+        key.position.set(2.4, 2.0, -2.6);
+        scene.add(key);
+        const rim = new THREE.DirectionalLight(0x9fc4ff, 0.9);
+        rim.position.set(-2.0, 1.0, 3.0);
+        scene.add(rim);
+
+        // Frame the shipped loadout, not the whole parts bin: every attachment
+        // variant is in the GLB so hiding is the only way to see the weapon as
+        // the game draws it. Names are compared exactly — the exporter writes
+        // the `__` names these paths use, so no loader sanitising can drift them.
+        const hidden = new Set(hide);
+        gltf.scene.traverse((o) => {
+          if (hidden.has(o.name)) o.visible = false;
+        });
+
+        // Frame what is actually drawn. Box3.setFromObject counts invisible
+        // geometry, so the hidden attachment variants would otherwise keep the
+        // camera pulled back to fit a rifle-length parts bin.
+        const shown = (o) => {
+          for (let p = o; p; p = p.parent) if (!p.visible) return false;
+          return true;
+        };
+        const box = new THREE.Box3();
+        gltf.scene.traverse((o) => {
+          if (o.isMesh && shown(o)) box.expandByObject(o);
+        });
+        const size = box.getSize(new THREE.Vector3());
+        const centre = box.getCenter(new THREE.Vector3());
+        const radius = size.length() * 0.5;
+
+        const cam = new THREE.PerspectiveCamera(34, 900 / 640, 0.01, 100);
+        const dist = (radius / Math.tan(((34 / 2) * Math.PI) / 180)) * zoom;
+        const dir = new THREE.Vector3(
+          Math.sin(yaw) * Math.cos(pitch),
+          Math.sin(pitch),
+          Math.cos(yaw) * Math.cos(pitch)
+        );
+        cam.position.copy(centre).addScaledVector(dir, dist);
+        cam.up.set(0, 1, 0);
+        if (roll) cam.up.applyAxisAngle(dir, roll);
+        cam.lookAt(centre);
+
+        previewRenderer.render(scene, cam);
+        const info = {
+          objects: 0,
+          materials: new Set(),
+          bones: 0,
+        };
+        gltf.scene.traverse((o) => {
+          info.objects++;
+          if (o.isMesh) {
+            const names = Array.isArray(o.material) ? o.material : [o.material];
+            for (const m of names) info.materials.add(m?.name ?? '?');
+          }
+          if (o.isBone) info.bones++;
+        });
+        return {
+          png: previewRenderer.domElement.toDataURL('image/png').split(',')[1],
+          bounds: { min: box.min.toArray(), max: box.max.toArray(), size: size.toArray() },
+          objects: info.objects,
+          bones: info.bones,
+          materials: [...info.materials].sort(),
+        };
+      }
+
+      /**
+       * The same model in CODM, this port's own interchange format.
+       *
+       * GLB is the better archive copy — it opens in Blender and any engine —
+       * but Unity has no native glTF importer and this machine cannot reach the
+       * package CDN to add one. CODM is deliberately dumb: a flat binary blob
+       * plus a JSON manifest of byte ranges. The C# importer that reads it is
+       * short enough to be obviously correct, and it can carry the vertex masks
+       * (wear / grime / AO) the GLB path drops, which is what paints the bare
+       * aluminium back onto the anodising.
+       */
+      async function bakeCodm(id) {
+        const builder = BUILDERS[id];
+        if (!builder) throw new Error(`unknown model "${id}"`);
+        const model = builder();
+        const { found, specs } = collect(model);
+
+        const chunks = [];
+        let offset = 0;
+        const push = (typed) => {
+          const bytes = new Uint8Array(typed.buffer, typed.byteOffset, typed.byteLength);
+          const at = offset;
+          chunks.push(bytes);
+          offset += bytes.byteLength;
+          const pad = (4 - (offset % 4)) % 4;
+          if (pad) {
+            chunks.push(new Uint8Array(pad));
+            offset += pad;
+          }
+          return { offset: at, length: bytes.byteLength };
+        };
+
+        const parts = [];
+        let tris = 0;
+        for (const { path, asm, geo } of found) {
+          const group = { path, node: nodeName(path), meshes: [], nodes: [] };
+          const buckets = geo ? new Map([['glass', geo]]) : asm.build();
+          for (const [matKey, g] of buckets) {
+            // The vertex masks the shader reads for edge wear and cavity grime.
+            // Without them every corner stays painted and the gun reads as a
+            // resin cast; upstream bakes them in the viewmodel for this reason.
+            bakeMasks(g, { wear: 1, grime: 1 });
+            const pos = g.getAttribute('position');
+            const nrm = g.getAttribute('normal');
+            const col = g.getAttribute('color');
+            const index = g.getIndex();
+            const positions = new Float32Array(pos.array.buffer, pos.array.byteOffset, pos.array.length);
+            const normals = new Float32Array(nrm.array.buffer, nrm.array.byteOffset, nrm.array.length);
+            const colors = col
+              ? new Float32Array(col.array.buffer, col.array.byteOffset, col.array.length)
+              : new Float32Array(pos.count * 3).fill(1);
+            // A bucket holding a single piece never goes through the merge that
+            // would have indexed it, so emit the trivial index rather than
+            // failing the whole model.
+            let indices;
+            if (index) {
+              indices = new Uint32Array(index.array.length);
+              for (let i = 0; i < index.array.length; i++) indices[i] = index.array[i];
+            } else {
+              indices = new Uint32Array(pos.count);
+              for (let i = 0; i < pos.count; i++) indices[i] = i;
+            }
+
+            const mesh = {
+              material: matKey,
+              vertexCount: pos.count,
+              indexCount: indices.length,
+              tris: indices.length / 3,
+              position: push(positions),
+              normal: push(normals),
+              color: push(colors),
+              index: push(indices),
+            };
+            tris += mesh.tris;
+            group.meshes.push(mesh);
+          }
+          for (const [n, t] of asm.nodes ?? []) {
+            const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(t.rot[0], t.rot[1], t.rot[2], 'XYZ'));
+            group.nodes.push({ name: n, position: t.pos, rotation: q.toArray() });
+          }
+          parts.push(group);
+        }
+
+        const rootNodes = [];
+        for (const [n, p] of Object.entries(model.nodes ?? {})) {
+          if (!Array.isArray(p)) continue;
+          rootNodes.push({ name: n, position: p, rotation: [0, 0, 0, 1] });
+        }
+
+        const total = chunks.reduce((a, c) => a + c.byteLength, 0);
+        const bin = new Uint8Array(total);
+        let at = 0;
+        for (const c of chunks) {
+          bin.set(c, at);
+          at += c.byteLength;
+        }
+
+        const manifest = {
+          format: 'codm/1',
+          id,
+          label: model.label ?? id,
+          fxClass: model.fxClass ?? null,
+          tris,
+          parts,
+          rootNodes,
+          specs,
+          materialDefs: (() => {
+            const used = new Set(parts.flatMap((p) => p.meshes.map((m) => m.material)));
+            const defs = {};
+            for (const key of used) {
+              const def = WEAPON_MATERIALS[key];
+              defs[key] = def ? { source: def[0], params: sanitizeParams(def[1]) } : { source: key, params: null };
+            }
+            return defs;
+          })(),
+          binBytes: total,
+        };
+        return { manifest, bin: toB64(bin) };
+      }
+
+      window.__BAKE__ = {
+        models: () => Object.keys(BUILDERS),
+        bakeModel,
+        bakeCodm,
+        render,
+      };
+      window.__READY__ = true;
+    </script>
+  </body>
+</html>

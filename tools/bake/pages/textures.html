@@ -1,0 +1,206 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>bake — textures</title>
+  </head>
+  <body style="margin: 0; background: #000">
+    <div id="c"></div>
+    <script type="module">
+      /**
+       * Texture bake page.
+       *
+       * The forge renders each surface straight into WebGLRenderTargets and
+       * never reads them back, so this page adds the missing half: point
+       * readRenderTargetPixels at each target, repack the channels the way
+       * Unity wants them, and hand back PNG data URLs.
+       *
+       * Channel plan (see src/materials/generator.js for the source layout):
+       *   albedo.png  RGB = colour, A = 255 (alpha kept only for cutout surfaces)
+       *   height.png  grey = albedo.a, for displacement/parallax in Unity
+       *   normal.png  RGB = tangent space, OpenGL +Y (Unity's default)
+       *   orm.png     R = AO, G = roughness, B = metalness  (as authored)
+       *   mso.png     R = metal, G = AO, B = 0, A = smoothness — URP/Lit mask map
+       */
+      import * as THREE from 'three';
+      import { MaterialSystem } from '/src/materials/index.js';
+      import { LIBRARY, resolveName } from '/src/materials/library.js';
+      import { WEAPON_MATERIALS } from '/src/weapons/materials.js';
+
+      const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
+      renderer.setSize(512, 512);
+      document.getElementById('c').appendChild(renderer.domElement);
+
+      const ms = new MaterialSystem({ renderer });
+      await ms.init({ config: { quality: 'ultra', q: { anisotropy: 16 } } });
+
+      const cv = document.createElement('canvas');
+      const cx = cv.getContext('2d');
+
+      function pack(buf, w, h, mode, useAlpha) {
+        cv.width = w;
+        cv.height = h;
+        const img = cx.createImageData(w, h);
+        const d = img.data;
+        for (let y = 0; y < h; y++) {
+          // WebGL reads bottom-up, canvas wants top-down.
+          const src = (h - 1 - y) * w * 4;
+          const dst = y * w * 4;
+          for (let x = 0; x < w; x++) {
+            const s = src + x * 4;
+            const t = dst + x * 4;
+            const r = buf[s];
+            const g = buf[s + 1];
+            const b = buf[s + 2];
+            const a = buf[s + 3];
+            if (mode === 'grey') {
+              const v = Math.round((r + g + b) / 3);
+              d[t] = d[t + 1] = d[t + 2] = v;
+              d[t + 3] = 255;
+            } else if (mode === 'mso') {
+              d[t] = b;
+              d[t + 1] = r;
+              d[t + 2] = 0;
+              d[t + 3] = 255 - g;
+            } else {
+              d[t] = r;
+              d[t + 1] = g;
+              d[t + 2] = b;
+              d[t + 3] = useAlpha ? a : 255;
+            }
+          }
+        }
+        cx.putImageData(img, 0, 0);
+        return cv.toDataURL('image/png').split(',')[1];
+      }
+
+      function findRT(tex) {
+        return ms._forge._owned.find((rt) => rt.texture === tex) ?? null;
+      }
+
+      function readTarget(tex) {
+        const rt = findRT(tex);
+        if (!rt) return null;
+        const w = rt.width;
+        const h = rt.height;
+        const buf = new Uint8Array(w * h * 4);
+        renderer.readRenderTargetPixels(rt, 0, 0, w, h, buf);
+        return { buf, w, h };
+      }
+
+      /**
+       * Pack every map of one texture set into base64 PNGs.
+       *
+       * `alphaMask` surfaces (foliage) carry a cutout in albedo.a rather than a
+       * height field, so the albedo keeps its alpha for Unity's alpha-clip and
+       * no height map is emitted at all.
+       */
+      function dump(set, key, alphaMask) {
+        const res = {
+          key,
+          size: set.size,
+          worldSize: set.worldSize,
+          relief: set.relief,
+          alphaMask: !!alphaMask,
+          maps: {},
+        };
+        const albedo = readTarget(set.albedo);
+        if (albedo) {
+          res.maps.albedo = pack(albedo.buf, albedo.w, albedo.h, 'rgb', !!alphaMask);
+          if (!alphaMask) res.maps.height = pack(albedo.buf, albedo.w, albedo.h, 'grey', false);
+        }
+        const normal = readTarget(set.normal);
+        if (normal) res.maps.normal = pack(normal.buf, normal.w, normal.h, 'rgb', false);
+        const orm = readTarget(set.orm);
+        if (orm) {
+          res.maps.orm = pack(orm.buf, orm.w, orm.h, 'rgb', false);
+          res.maps.mso = pack(orm.buf, orm.w, orm.h, 'mso', false);
+        }
+        return res;
+      }
+
+      const alphaMaskOf = (name) => {
+        const def = LIBRARY[resolveName(name)] ?? {};
+        return !!(def.alphaMask ?? def.bake?.alphaMask);
+      };
+
+      /**
+       * Weapon material entries mix JSON numbers with THREE objects and the odd
+       * callback. The Unity side only needs the scalars (tint, scale, roughness
+       * multipliers), so flatten what survives a JSON round trip and turn any
+       * colour-like object into hex.
+       */
+      function sanitize(v, depth = 0) {
+        if (depth > 4 || v == null) return undefined;
+        const t = typeof v;
+        if (t === 'number' || t === 'string' || t === 'boolean') return v;
+        if (Array.isArray(v)) {
+          const a = v.map((x) => sanitize(x, depth + 1)).filter((x) => x !== undefined);
+          return a.length ? a : undefined;
+        }
+        if (t === 'object') {
+          if (v.isColor) return '#' + v.getHexString();
+          if (v.isVector4 || v.isVector2) return v.toArray();
+          const o = {};
+          for (const [k, x] of Object.entries(v)) {
+            if (k === 'three' || k === 'bake') continue;
+            const s = sanitize(x, depth + 1);
+            if (s !== undefined) o[k] = s;
+          }
+          return Object.keys(o).length ? o : undefined;
+        }
+        return undefined;
+      }
+
+      /** Bake one library surface at `size` and return every map as base64 PNG. */
+      function read(name, size = 2048) {
+        const set = ms.getTextureSet(name, { bake: { size } });
+        if (!set) throw new Error(`no texture set for "${name}"`);
+        const out = dump(set, resolveName(name), alphaMaskOf(name));
+        out.kind = 'library';
+        out.source = resolveName(name);
+        return out;
+      }
+
+      const weaponKeys = Object.entries(WEAPON_MATERIALS)
+        .filter(([, def]) => Array.isArray(def) && typeof def[0] === 'string' && LIBRARY[resolveName(def[0])])
+        .map(([key]) => key);
+
+      /**
+       * Bake one named set. Library keys bake from the library def; weapon keys
+       * bake through the weapon's own [surface, opts] pair, which is what gives
+       * e.g. `alu` a different seed and relief to plain `rubber`.
+       */
+      function readKey(kind, key, size = 2048) {
+        if (kind !== 'weapon') return read(key, size);
+        const def = WEAPON_MATERIALS[key];
+        if (!def) throw new Error(`unknown weapon material "${key}"`);
+        const source = def[0];
+        const opts = { ...def[1], bake: { ...(def[1]?.bake ?? {}), size } };
+        const set = ms.getTextureSet(source, opts);
+        if (!set) throw new Error(`no texture set for weapon material "${key}"`);
+        const out = dump(set, key, alphaMaskOf(source));
+        out.kind = 'weapon';
+        out.source = resolveName(source);
+        out.params = sanitize(def[1]);
+        return out;
+      }
+
+      const gl = renderer.getContext();
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+
+      window.__BAKE__ = {
+        read,
+        readKey,
+        keys: () => ({ library: ms.names(), weapon: weaponKeys }),
+        gpu: {
+          renderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+          vendor: dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+          maxTexture: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+          webgl2: renderer.capabilities.isWebGL2,
+        },
+      };
+      window.__READY__ = true;
+    </script>
+  </body>
+</html>
