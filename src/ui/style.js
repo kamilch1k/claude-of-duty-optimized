@@ -629,7 +629,7 @@ const CSS = `
   gap: calc(var(--u) * 4); padding: calc(var(--u) * 3.2) 0;
   border-bottom: 1px solid var(--hair-2);
 }
-.ow-row > .name { font-size: calc(11.5px * var(--k)); letter-spacing:.2em; color: var(--ink); }
+.ow-row > .name { font-size: calc(11.5px * var(--k)); letter-spacing:.2em; color: var(--ink); white-space: nowrap; }
 .ow-row > .val { font-family: var(--fm); font-size: calc(11px * var(--k)); color: var(--amber);
   letter-spacing:.04em; min-width: calc(46px * var(--k)); text-align:right; }
 .ow-seg { display:flex; gap:0; }
@@ -672,6 +672,15 @@ const CSS = `
 .ow-btn:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.4); }
 .ow-btn.primary { background: var(--amber); border-color: var(--amber); color:#100b02; }
 .ow-btn.primary:hover { background:#ffc251; }
+.ow-btn-danger { border-color: rgba(255,120,90,.35); color:#ffb9a6; }
+.ow-btn-danger:hover {
+  background: rgba(255,84,58,.16); border-color: rgba(255,120,90,.75); color:#ffd9cf;
+}
+.ow-btns-col { flex-direction: column; gap: calc(var(--u) * 1.6); }
+.ow-btn-wide {
+  width: 100%; text-align: left;
+  padding: calc(var(--u) * 2.6) calc(var(--u) * 3.4);
+}
 .ow-menu .hint {
   margin-top: calc(var(--u) * 4); font-size: calc(9.5px * var(--k));
   letter-spacing:.2em; color: var(--ink-3);

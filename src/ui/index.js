@@ -406,13 +406,23 @@ export class UiSystem {
     s.time = t.elapsed;
 
     // ---- pause -----------------------------------------------------------
-    if (ctx.input.enabled && !ctx.input.frozen) {
+    /**
+     * The pause key is handled even when `input.enabled` is off, as long as the
+     * menu is open. Opening the menu disables player control, and gating the one
+     * key that gets you back out on the same flag meant Escape could open the
+     * menu but never close it or step back out of a submenu — the only way out
+     * was the mouse. Nothing else in this block runs while paused: the weapon,
+     * movement and pointer-lock paths still require enabled input.
+     */
+    if (this.menu.open || (ctx.input.enabled && !ctx.input.frozen)) {
       if (ctx.input.actionPressed('pause')) this.menu.toggle();
-      // Losing pointer lock mid-match is the same intent as pressing Escape.
-      if (ctx.input.pointerLocked) this._hadPointerLock = true;
-      else if (this._hadPointerLock && !this.menu.open) {
-        this._hadPointerLock = false;
-        this.menu.show();
+      if (ctx.input.enabled && !ctx.input.frozen) {
+        // Losing pointer lock mid-match is the same intent as pressing Escape.
+        if (ctx.input.pointerLocked) this._hadPointerLock = true;
+        else if (this._hadPointerLock && !this.menu.open) {
+          this._hadPointerLock = false;
+          this.menu.show();
+        }
       }
     }
     this.menu.update(rawDt);

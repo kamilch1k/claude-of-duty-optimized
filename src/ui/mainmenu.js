@@ -86,9 +86,14 @@ function el(html) {
  * @returns {Promise<{map:string, mode:string}>}
  */
 export function showMainMenu(initial = {}) {
-  const style = document.createElement('style');
-  style.textContent = CSS;
-  document.head.appendChild(style);
+  // The menu is re-shown after every Exit, and a <style> per visit would pile
+  // identical sheets into <head> for as long as the session lasts.
+  if (!document.getElementById('ow-fe-style')) {
+    const style = document.createElement('style');
+    style.id = 'ow-fe-style';
+    style.textContent = CSS;
+    document.head.appendChild(style);
+  }
 
   let map = MAPS.some((m) => m.id === initial.map) ? initial.map : MAPS[0].id;
   let mode = MODES.some((m) => m.id === initial.mode) ? initial.mode : MODES[0].id;

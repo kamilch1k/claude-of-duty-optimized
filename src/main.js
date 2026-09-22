@@ -51,189 +51,271 @@ const lockstep = capture && params.get('lockstep') === '1';
 await portal.init();
 
 const skipMenu = capture || params.has('map') || params.get('menu') === '0';
-const choice = skipMenu
-  ? { map: params.get('map') ?? 'street', mode: params.get('mode') ?? 'tdm' }
-  : await showMainMenu({ map: params.get('map'), mode: params.get('mode') });
-
-// Put the loading screen up and let it actually paint before anything blocks:
-// engine.init() holds the main thread, so a frame has to land first or the
-// overlay never appears.
-//
-// Shown on the deep-link path too. `?map=` is how every tool, probe and deep
-// link boots, and without an overlay that path is a BLACK SCREEN for the whole
-// build — 12-25 s of nothing, which reads as a hung tab. Not shown for
-// `capture`: the harness compares pixels, and an overlay with a running CSS
-// animation in frame is precisely the nondeterminism baseline.mjs exists to
-// eliminate.
-const loading = capture ? null : showLoading(MAPS.find((m) => m.id === choice.map)?.name ?? choice.map);
-if (loading) {
-  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-}
-
-const config = createConfig({
-  // Keep the launch path friendly to browser portals. Use ?q=ultra when
-  // comparing the full desktop-quality renderer.
-  quality: params.get('q') ?? 'low',
-  map: choice.map,
-  mode: choice.mode,
-  // ?skin= applies a weapon finish at boot — the only way to review one under
-  // the real sun, since the weapons preview studio backlights every view.
-  skin: params.get('skin') ?? null,
-  // Same reason: an attachment can only be judged in the game's own light.
-  muzzle: params.get('muzzle') ?? null,
-  mag: params.get('mag') ?? null,
-  stock: params.get('stock') ?? null,
-  optic: params.get('optic') ?? null,
-  deterministic: capture,
-});
-
-const canvas = document.getElementById('game');
-
-const engine = new Engine({ canvas, config });
-
-// Registration order is irrelevant — Registry topo-sorts on static deps.
-engine
-  .add(RenderSystem)
-  .add(MaterialSystem)
-  .add(SkySystem)
-  .add(WorldSystem)
-  .add(PhysicsSystem)
-  .add(PlayerSystem)
-  .add(WeaponSystem)
-  .add(FxSystem)
-  .add(AiSystem)
-  .add(UiSystem)
-  .add(AudioSystem);
-
-try {
-  await engine.init();
-} catch (err) {
-  console.error('[boot] init failed', err);
-  document.body.insertAdjacentHTML(
-    'beforeend',
-    `<pre style="position:fixed;inset:0;padding:2rem;color:#f66;background:#000;
-       font:12px/1.5 ui-monospace,monospace;overflow:auto;z-index:9999;white-space:pre-wrap">
-BOOT FAILURE\n\n${err.stack ?? err.message}</pre>`
-  );
-  throw err;
-}
-
-const shotApi = installShotApi(engine, { capture, lockstep });
-
-// Compile every shader permutation before the frame loop starts. Measured: without
-// this, 86 programs compile lazily during play, up to 30 on one frame, producing
-// 3.1-3.9 SECOND stalls. See src/core/prewarm.js.
-//
-// THE OLD CHOICE WAS BETWEEN TWO BAD OUTCOMES, AND NEITHER IS ACCEPTABLE.
-//
-//   prewarm on   boot 48 s, worst in-play frame   69 ms
-//   prewarm off  boot  5 s, worst in-play frame 1005 ms
-//
-// Blocking pre-warm costs a flat ~20 s of held main thread, which a player does
-// not experience as a loading screen but as a dead page: nothing renders, the
-// menu does not answer clicks, the tab looks hung. Skipping it keeps boot fast
-// and moves that cost into gameplay, as the multi-second compile stall the
-// pre-warm exists to remove.
-//
-// PACED pre-warm removes the trade. It admits one coarse driver job per
-// animation frame, so the work lands behind the composited loading screen while
-// the page stays responsive, and gameplay starts with every permutation already
-// translated by the driver. `transients: 'play'` warms what a player triggers in
-// the first seconds of a fight — the FX bursts, the fire/ADS poses, the combat
-// HUD — measured with tools/fire-programs.mjs to be exactly the set that
-// otherwise compiled on the first trigger pull or the first hit taken.
-//
-// The capture harness keeps the old blocking, transient-free order: the pixel
-// gate compares frames, not boot duration, and a deterministically pumped frame
-// count is the whole point of tools/baseline.mjs.
-const prewarmParam = params.get('prewarm');
-const wantPrewarm = prewarmParam === '1' || (prewarmParam !== '0' && !capture);
-const progress = { status: wantPrewarm ? 'running' : 'skipped', progress: 0, map: config.map };
-window.__PREWARM__ = progress;
-
-const warmup = wantPrewarm
-  ? await prewarm(engine, {
-    transients: capture ? false : (params.get('warm') ?? 'play'),
-    paced: !capture,
-    budgetMs: 4,
-    /**
-     * REAL FRAMES, not just compiles.
-     *
-     * `renderer.compileAsync` builds the PROGRAM but touches no buffers: three
-     * uploads a geometry and binds a texture on first DRAW, and the program it
-     * wants can differ from the one compiled because the patcher's key or the
-     * visible light set only settles inside a rendered frame. MEASURED on an
-     * RTX 4080 with compiles alone: `csm-depth` + `ow-prepass` compile for
-     * 218 ms on the first shadowed frame, and one world material plus ten
-     * geometry uploads cost 637 ms at 6.5 s into play — all of it first-draw
-     * work that compiling cannot reach.
-     *
-     * The capture harness keeps this off: it advances subsystem state that core
-     * cannot fully restore, so it is not pixel-neutral, and the gate outranks it.
-     */
-    drawFrames: !capture,
-    shadow: !capture,
-    onProgress: (value) => {
-      progress.progress = value;
-      loading?.setProgress?.(value);
-    },
-  })
-  : { ok: false, reason: `off${capture ? ' for capture' : ''} — ?prewarm=1 to force` };
-Object.assign(progress, warmup, {
-  status: warmup.aborted
-    ? 'aborted'
-    : wantPrewarm
-      ? warmup.ok ? 'done' : 'failed'
-      : 'skipped',
-  progress: warmup.aborted ? progress.progress : 1,
-});
-console.info('[boot] prewarm', warmup);
-window.__PREWARM__ = progress;
-
-engine.start();
-loading?.done();
 
 /**
- * Portal handshake. `loaded()` takes the portal's own loading screen down, and
- * the gameplay bracket has to follow real play rather than the page lifetime —
- * both portals use it for session analytics and Yandex certification checks it.
+ * ONE MATCH, START TO FINISH.
+ *
+ * Everything from the loading overlay to the frame loop lives in here so that a
+ * match can END. The pause menu's Exit button emits `ui:exit`, this function
+ * tears the engine down and returns, and the front menu comes back up — which is
+ * the only way "exit" can mean anything other than a page reload that throws away
+ * twenty seconds of pre-warm and puts the player back at square one.
+ *
+ * The capture harness and the `?map=` deep links never resolve it: they own the
+ * page, there is no front menu to return to, and the promise below is simply
+ * never settled for them.
  */
-portal.loaded();
-portal.gameplayStart();
-engine.events.on('ui:pause', ({ paused }) => {
-  if (paused) portal.gameplayStop();
-  else portal.gameplayStart();
-});
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) portal.gameplayStop();
-  else if (!engine.ctx.peek('ui')?.menu?.open) portal.gameplayStart();
-});
+let currentEngine = null;
 
+async function runMatch(choice) {
+  // Put the loading screen up and let it actually paint before anything blocks:
+  // engine.init() holds the main thread, so a frame has to land first or the
+  // overlay never appears.
+  //
+  // Shown on the deep-link path too. `?map=` is how every tool, probe and deep
+  // link boots, and without an overlay that path is a BLACK SCREEN for the whole
+  // build — 12-25 s of nothing, which reads as a hung tab. Not shown for
+  // `capture`: the harness compares pixels, and an overlay with a running CSS
+  // animation in frame is precisely the nondeterminism baseline.mjs exists to
+  // eliminate.
+  const loading = capture ? null : showLoading(MAPS.find((m) => m.id === choice.map)?.name ?? choice.map);
+  if (loading) {
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  }
 
-// Capture harness handshake: only flag ready once a frame has actually landed.
-//
-// BOOT_FRAMES is deliberately a frame COUNT, not a rAF race. In lockstep mode the
-// engine has no loop of its own, so we hand-pump exactly this many frames and only
-// then raise __READY__; the shot is therefore always applied at engine frame 3, no
-// matter how long boot (or pre-warm) took in wall-clock terms.
-const BOOT_FRAMES = 3;
-if (lockstep) {
-  await shotApi.pump(BOOT_FRAMES);
-  window.__READY__ = true;
-} else {
-  let warm = 0;
-  const readyProbe = () => {
-    if (++warm >= BOOT_FRAMES) {
-      window.__READY__ = true;
-      return;
-    }
-    requestAnimationFrame(readyProbe);
+  const config = createConfig({
+    // Keep the launch path friendly to browser portals. Use ?q=ultra when
+    // comparing the full desktop-quality renderer.
+    quality: params.get('q') ?? 'low',
+    map: choice.map,
+    mode: choice.mode,
+    // ?skin= applies a weapon finish at boot — the only way to review one under
+    // the real sun, since the weapons preview studio backlights every view.
+    skin: params.get('skin') ?? null,
+    // Same reason: an attachment can only be judged in the game's own light.
+    muzzle: params.get('muzzle') ?? null,
+    mag: params.get('mag') ?? null,
+    stock: params.get('stock') ?? null,
+    optic: params.get('optic') ?? null,
+    deterministic: capture,
+  });
+
+  /**
+   * A FRESH CANVAS PER MATCH.
+   *
+   * A WebGL context is bound to the element it was created on, so a second match
+   * reusing the node would inherit the first match's context — and with it every
+   * program, buffer and piece of state three believes it owns. Cloning the node
+   * (attributes only, so `id="game"` and its CSS come along) gives the new
+   * renderer a context nobody else has touched; the old element is orphaned and
+   * collected along with its GL objects.
+   */
+  const old = document.getElementById('game');
+  if (old?.dataset.used === '1') {
+    const fresh = old.cloneNode(false);
+    delete fresh.dataset.used;
+    old.replaceWith(fresh);
+  }
+  document.getElementById('game').dataset.used = '1';
+
+  const canvas = document.getElementById('game');
+
+  const engine = new Engine({ canvas, config });
+  currentEngine = engine;
+
+  // Registration order is irrelevant — Registry topo-sorts on static deps.
+  engine
+    .add(RenderSystem)
+    .add(MaterialSystem)
+    .add(SkySystem)
+    .add(WorldSystem)
+    .add(PhysicsSystem)
+    .add(PlayerSystem)
+    .add(WeaponSystem)
+    .add(FxSystem)
+    .add(AiSystem)
+    .add(UiSystem)
+    .add(AudioSystem);
+
+  try {
+    await engine.init();
+  } catch (err) {
+    console.error('[boot] init failed', err);
+    loading?.done();
+    document.body.insertAdjacentHTML(
+      'beforeend',
+      `<pre style="position:fixed;inset:0;padding:2rem;color:#f66;background:#000;
+         font:12px/1.5 ui-monospace,monospace;overflow:auto;z-index:9999;white-space:pre-wrap">
+BOOT FAILURE\n\n${err.stack ?? err.message}</pre>`
+    );
+    throw err;
+  }
+
+  const shotApi = installShotApi(engine, { capture, lockstep });
+
+  // Compile every shader permutation before the frame loop starts. Measured: without
+  // this, 86 programs compile lazily during play, up to 30 on one frame, producing
+  // 3.1-3.9 SECOND stalls. See src/core/prewarm.js.
+  //
+  // THE OLD CHOICE WAS BETWEEN TWO BAD OUTCOMES, AND NEITHER IS ACCEPTABLE.
+  //
+  //   prewarm on   boot 48 s, worst in-play frame   69 ms
+  //   prewarm off  boot  5 s, worst in-play frame 1005 ms
+  //
+  // Blocking pre-warm costs a flat ~20 s of held main thread, which a player does
+  // not experience as a loading screen but as a dead page: nothing renders, the
+  // menu does not answer clicks, the tab looks hung. Skipping it keeps boot fast
+  // and moves that cost into gameplay, as the multi-second compile stall the
+  // pre-warm exists to remove.
+  //
+  // PACED pre-warm removes the trade. It admits one coarse driver job per
+  // animation frame, so the work lands behind the composited loading screen while
+  // the page stays responsive, and gameplay starts with every permutation already
+  // translated by the driver. `transients: 'play'` warms what a player triggers in
+  // the first seconds of a fight — the FX bursts, the fire/ADS poses, the combat
+  // HUD — measured with tools/fire-programs.mjs to be exactly the set that
+  // otherwise compiled on the first trigger pull or the first hit taken.
+  //
+  // The capture harness keeps the old blocking, transient-free order: the pixel
+  // gate compares frames, not boot duration, and a deterministically pumped frame
+  // count is the whole point of tools/baseline.mjs.
+  const prewarmParam = params.get('prewarm');
+  const wantPrewarm = prewarmParam === '1' || (prewarmParam !== '0' && !capture);
+  const progress = { status: wantPrewarm ? 'running' : 'skipped', progress: 0, map: config.map };
+  window.__PREWARM__ = progress;
+
+  const warmup = wantPrewarm
+    ? await prewarm(engine, {
+      transients: capture ? false : (params.get('warm') ?? 'play'),
+      paced: !capture,
+      budgetMs: 4,
+      /**
+       * REAL FRAMES, not just compiles.
+       *
+       * `renderer.compileAsync` builds the PROGRAM but touches no buffers: three
+       * uploads a geometry and binds a texture on first DRAW, and the program it
+       * wants can differ from the one compiled because the patcher's key or the
+       * visible light set only settles inside a rendered frame. MEASURED on an
+       * RTX 4080 with compiles alone: `csm-depth` + `ow-prepass` compile for
+       * 218 ms on the first shadowed frame, and one world material plus ten
+       * geometry uploads cost 637 ms at 6.5 s into play — all of it first-draw
+       * work that compiling cannot reach.
+       *
+       * The capture harness keeps this off: it advances subsystem state that core
+       * cannot fully restore, so it is not pixel-neutral, and the gate outranks it.
+       */
+      drawFrames: !capture,
+      shadow: !capture,
+      onProgress: (value) => {
+        progress.progress = value;
+        loading?.setProgress?.(value);
+      },
+    })
+    : { ok: false, reason: `off${capture ? ' for capture' : ''} — ?prewarm=1 to force` };
+  Object.assign(progress, warmup, {
+    status: warmup.aborted
+      ? 'aborted'
+      : wantPrewarm
+        ? warmup.ok ? 'done' : 'failed'
+        : 'skipped',
+    progress: warmup.aborted ? progress.progress : 1,
+  });
+  console.info('[boot] prewarm', warmup);
+  window.__PREWARM__ = progress;
+
+  engine.start();
+  loading?.done();
+
+  /**
+   * Portal handshake. `loaded()` takes the portal's own loading screen down, and
+   * the gameplay bracket has to follow real play rather than the page lifetime —
+   * both portals use it for session analytics and Yandex certification checks it.
+   */
+  portal.loaded();
+  portal.gameplayStart();
+  // Named, because teardown has to be able to unhook them: a listener still
+  // attached after `dispose()` fires against a dead engine on the next tab
+  // switch, and `engine.events` is cleared underneath it.
+  const onPause = ({ paused }) => {
+    if (paused) portal.gameplayStop();
+    else portal.gameplayStart();
   };
-  requestAnimationFrame(readyProbe);
+  const onVisibility = () => {
+    if (document.hidden) portal.gameplayStop();
+    else if (!engine.ctx.peek('ui')?.menu?.open) portal.gameplayStart();
+  };
+  engine.events.on('ui:pause', onPause);
+  document.addEventListener('visibilitychange', onVisibility);
+
+
+  // Capture harness handshake: only flag ready once a frame has actually landed.
+  //
+  // BOOT_FRAMES is deliberately a frame COUNT, not a rAF race. In lockstep mode the
+  // engine has no loop of its own, so we hand-pump exactly this many frames and only
+  // then raise __READY__; the shot is therefore always applied at engine frame 3, no
+  // matter how long boot (or pre-warm) took in wall-clock terms.
+  const BOOT_FRAMES = 3;
+  if (lockstep) {
+    await shotApi.pump(BOOT_FRAMES);
+    window.__READY__ = true;
+  } else {
+    let warm = 0;
+    const readyProbe = () => {
+      if (++warm >= BOOT_FRAMES) {
+        window.__READY__ = true;
+        return;
+      }
+      requestAnimationFrame(readyProbe);
+    };
+    requestAnimationFrame(readyProbe);
+  }
+
+  window.__ENGINE__ = engine;
+
+  /**
+   * The match is running. Wait for the one thing that ends it.
+   *
+   * 'ui:exit' is the pause menu's Exit button. Capture runs and ?map= deep
+   * links never resolve it — they own the page, and there is no front menu to
+   * go back to — so their lifetime is the page's, as it has always been.
+   */
+  if (skipMenu) return;
+  await new Promise((resolve) => engine.events.on('ui:exit', resolve));
+
+  /**
+   * TEARDOWN. The next match builds a whole new engine on a whole new canvas, so
+   * anything that outlives this one has to be unhooked by hand: the pause
+   * listener, the visibility listener, the portal gameplay bracket, and the two
+   * globals the tooling reads. dispose() releases the GPU objects and removes the
+   * HUD; a listener still attached after it would fire against a dead engine on
+   * the next tab switch.
+   */
+  engine.events.off('ui:pause', onPause);
+  document.removeEventListener('visibilitychange', onVisibility);
+  portal.gameplayStop();
+  window.__ENGINE__ = null;
+  window.__READY__ = false;
+  engine.dispose();
+  currentEngine = null;
 }
 
-window.__ENGINE__ = engine;
+/**
+ * FRONT END FIRST, ENGINE SECOND — and again after Exit.
+ *
+ * A match now ENDS, which is the only way "exit to menu" can mean anything other
+ * than a page reload: reloading throws away the pre-warm and puts the player back
+ * through the whole boot for wanting to change the map. The menu is plain DOM and
+ * survives the engine it is about to replace.
+ */
+if (skipMenu) {
+  await runMatch({ map: params.get('map') ?? 'street', mode: params.get('mode') ?? 'tdm' });
+} else {
+  for (;;) {
+    const choice = await showMainMenu({ map: params.get('map'), mode: params.get('mode') });
+    await runMatch(choice);
+  }
+}
 
 if (import.meta.hot) {
-  import.meta.hot.dispose(() => engine.dispose());
+  import.meta.hot.dispose(() => currentEngine?.dispose());
 }

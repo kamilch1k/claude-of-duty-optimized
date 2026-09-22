@@ -33,6 +33,13 @@ const OPTIC_LABELS = {
 const PRESETS = ['performance', 'low', 'medium', 'high', 'ultra'];
 
 /**
+ * Short enough for a five-way segmented control on a 430 px panel.
+ * "PERFORMANCE" pushed the row label onto a second line and made the whole
+ * column read as ragged, which is a bad trade for one word.
+ */
+const PRESET_LABELS = { performance: 'perf', low: 'low', medium: 'med', high: 'high', ultra: 'ultra' };
+
+/**
  * The advanced switches, in the order they cost frame time on the web profile.
  * Shadows first because they are 1.3 ms of a 4.5 ms frame at 1080p — 326 of the
  * frame's 644 draw calls and 3.0M of its 5.1M triangles.
@@ -66,19 +73,41 @@ export class PauseMenu {
     this.root = el('div', 'ow-menu', parent);
     const inner = el('div', 'ow-menu-inner', this.root);
 
-    const h = el('h1', null, inner, 'Paused');
-    h.textContent = 'PAUSED';
+    this.title = el('h1', null, inner, 'PAUSED');
     el('div', 'sub', inner, 'OVERWATCH — TACTICAL OPERATIONS');
     el('div', 'rule', inner);
 
-    this.rows = el('div', null, inner);
+    /**
+     * TWO PAGES, ONE OVERLAY.
+     *
+     * Escape used to open the settings screen directly, which meant the two
+     * things a player actually wants when they press it — get back to the game,
+     * or leave it — were buried under a gunsmith. The first page is the three
+     * decisions; the settings page is everything that used to be here, one
+     * click further in and one Escape away.
+     */
+    this.page = 'root';
+    this.rootPage = el('div', 'ow-page', inner);
+    const rootBtns = el('div', 'ow-btns ow-btns-col', this.rootPage);
+    this.playBtn = el('button', 'ow-btn primary ow-btn-wide', rootBtns, 'Play');
+    this.playBtn.type = 'button';
+    this.playBtn.addEventListener('click', () => this.close());
+    this.settingsBtn = el('button', 'ow-btn ow-btn-wide', rootBtns, 'Settings');
+    this.settingsBtn.type = 'button';
+    this.settingsBtn.addEventListener('click', () => this.setPage('settings'));
+    this.exitBtn = el('button', 'ow-btn ow-btn-wide ow-btn-danger', rootBtns, 'Exit to menu');
+    this.exitBtn.type = 'button';
+    this.exitBtn.addEventListener('click', () => this.exit());
+
+    this.settingsPage = el('div', 'ow-page', inner);
+    this.rows = el('div', null, this.settingsPage);
 
     // ---- quality preset --------------------------------------------------
     this.qBtns = [];
     const qRow = this._row('Graphics Preset');
     const seg = el('div', 'ow-seg', qRow);
     for (const p of PRESETS) {
-      const b = el('button', null, seg, p);
+      const b = el('button', null, seg, PRESET_LABELS[p] ?? p);
       b.type = 'button';
       b.addEventListener('click', () => this.setQuality(p));
       this.qBtns.push(b);
@@ -254,10 +283,10 @@ export class PauseMenu {
     }
 
     // ---- buttons ---------------------------------------------------------
-    const btns = el('div', 'ow-btns', inner);
-    this.resumeBtn = el('button', 'ow-btn primary', btns, 'Resume');
-    this.resumeBtn.type = 'button';
-    this.resumeBtn.addEventListener('click', () => this.close());
+    const btns = el('div', 'ow-btns', this.settingsPage);
+    this.backBtn = el('button', 'ow-btn', btns, 'Back');
+    this.backBtn.type = 'button';
+    this.backBtn.addEventListener('click', () => this.setPage('root'));
     const reset = el('button', 'ow-btn', btns, 'Defaults');
     reset.type = 'button';
     reset.addEventListener('click', () => {
@@ -266,13 +295,24 @@ export class PauseMenu {
       this.ctx.config.invertY = false;
       this.setQuality('ultra');
     });
-    el('div', 'hint', inner, 'ESC RESUME · WASD MOVE · SHIFT SPRINT · R RELOAD · F USE');
+    el('div', 'hint', this.settingsPage, 'ESC BACK · WASD MOVE · SHIFT SPRINT · R RELOAD · F USE');
 
     this.open = false;
     this.shown = 0;
+    this.setPage('root');
     setStyle(this.root, 'display', 'none');
     setStyle(this.root, 'cursor', 'default');
     this.syncFromConfig();
+  }
+
+  /** 'root' | 'settings'. The overlay itself is the same either way. */
+  setPage(page = 'root') {
+    const settings = page === 'settings';
+    this.page = settings ? 'settings' : 'root';
+    setStyle(this.rootPage, 'display', settings ? 'none' : '');
+    setStyle(this.settingsPage, 'display', settings ? '' : 'none');
+    setText(this.title, settings ? 'SETTINGS' : 'PAUSED');
+    if (settings) this.syncFromConfig();
   }
 
   _row(name) {
@@ -410,13 +450,28 @@ export class PauseMenu {
     this.fov?.set(cfg.fov ?? 80);
   }
 
+  /**
+   * Escape goes BACK one level before it goes anywhere else: from the settings
+   * page it returns to the three buttons, and only from the root does it resume
+   * the match. Closing the whole overlay out of a submenu is how a player ends
+   * up unpaused mid-firefight with a slider they were still reading.
+   */
   toggle() {
-    this.open ? this.close() : this.show();
+    if (!this.open) {
+      this.show();
+      return;
+    }
+    if (this.page === 'settings') {
+      this.setPage('root');
+      return;
+    }
+    this.close();
   }
 
   show() {
     if (this.open) return;
     this.open = true;
+    this.setPage('root');
     this.syncFromConfig();
     setStyle(this.root, 'display', '');
     // Release the cursor AND stop anything re-grabbing it: a click on a setting
@@ -432,15 +487,28 @@ export class PauseMenu {
     this.ctx.events.emit('ui:pause', { paused: true });
   }
 
-  close() {
+  close({ relock = true } = {}) {
     if (!this.open) return;
     this.open = false;
+    this.setPage('root');
     const t = this.ctx.time;
     if (t) t.scale = this._prevScale ?? 1;
     this.ctx.peek('player')?.setControlEnabled?.(true);
     if (this.ctx.input) this.ctx.input.lockSuppressed = false;
-    this.ctx.input?.requestPointerLock?.();
+    // A close that is really a teardown must NOT re-grab the pointer: the front
+    // menu is about to want it.
+    if (relock) this.ctx.input?.requestPointerLock?.();
     this.ctx.events.emit('ui:pause', { paused: false });
+  }
+
+  /**
+   * Leave the match. The UI does not own the engine lifecycle, so this only
+   * restores what `show()` froze and announces the intent — main.js disposes the
+   * engine and puts the front menu back up.
+   */
+  exit() {
+    this.close({ relock: false });
+    this.ctx.events.emit('ui:exit');
   }
 
   /** Driven with unscaled time so the fade still runs while the game is frozen. */
