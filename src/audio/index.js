@@ -32,6 +32,7 @@
 import { NoiseBank, SPEED_OF_SOUND, clamp, gain as mkGain } from './dsp.js';
 import { Mixer } from './mixer.js';
 import { SpatialField } from './spatial.js';
+import { VoiceBank, shellClass } from './shotbank.js';
 import { Ambience, ambientOneShot, ONE_SHOTS } from './ambience.js';
 import { WEAPON_PROFILES, resolveProfile, weaponShot, bulletWhizz, dryFire } from './weapons.js';
 import {
@@ -170,6 +171,19 @@ export class AudioSystem {
       this.ambience = new Ambience(actx, this.bank, this.mixer, this.field, this.rng.fork());
       this.ambience.start();
       this.mixer.setSpace(this._space, 0.001);
+
+      this.voiceBank = new VoiceBank(this.rng.fork());
+      this.voiceBank.registerDefaults(WEAPON_PROFILES.rifle);
+      for (const k of [WEAPON_PROFILES.rifle, 'shell:hard', 'shell:soft', 'shell:mid',
+                       'impact:hard', 'impact:soft', 'impact:mid']) {
+        this.voiceBank.request(k, actx.sampleRate);
+      }
+      /**
+       * Bake the rifle immediately — it is what the player spawns holding, and
+       * baking on first fire would put the cost exactly where the stutter was.
+       * Not awaited: rendering happens off the main thread and the procedural
+       * path covers the handful of shots before it lands.
+       */
 
       if (actx.state === 'suspended') await actx.resume();
       this.running = true;
@@ -336,17 +350,44 @@ export class AudioSystem {
     const { actx, bank } = this;
     const rng = this.rng;
     switch (kind) {
-      case 'shot':
-        return weaponShot(actx, bank, rng, o.profile ?? WEAPON_PROFILES.rifle, {
-          when, distance: dist, firstPerson: o.firstPerson,
-          echoBoost: 0.75 + this._space.street * 0.7 + this._space.tight * 0.35 +
-            this._space.tunnel * 0.8 + this._space.open * 0.2,
+      case 'shot': {
+        const profile = o.profile ?? WEAPON_PROFILES.rifle;
+        const echoBoost = 0.75 + this._space.street * 0.7 + this._space.tight * 0.35 +
+          this._space.tunnel * 0.8 + this._space.open * 0.2;
+        /**
+         * The player's own weapon comes off the bake — 3 graph operations
+         * instead of 547 (see shotbank.js). Only first person: the procedural
+         * voice rebalances its layers by range, so a buffer rendered at zero
+         * metres is only honest at zero metres. Enemy fire stays synthesised.
+         *
+         * `request` is idempotent and returns immediately, so the first shots of
+         * a match are procedural while the bake lands and nothing waits on it.
+         */
+        if (o.firstPerson) {
+          const baked = this.voiceBank?.play(actx, profile, rng, when,
+            { send: profile.send * echoBoost });
+          if (baked) return baked;
+        }
+        return weaponShot(actx, bank, rng, profile, {
+          when, distance: dist, firstPerson: o.firstPerson, echoBoost,
         });
+      }
       case 'whizz': return bulletWhizz(actx, bank, rng, { when, miss: o.miss, gain: o.gain });
       case 'dryfire': return dryFire(actx, bank, rng, { when });
-      case 'impact': return surfaceImpact(actx, bank, rng, { when, surface: o.surface, energy: o.energy });
+      case 'impact': {
+        const baked = this.voiceBank?.play(actx, `impact:${shellClass(o.surface)}`, rng, when,
+          { level: clamp(o.energy ?? 1, 0.15, 2) });
+        return baked ?? surfaceImpact(actx, bank, rng, { when, surface: o.surface, energy: o.energy });
+      }
       case 'step': return footstep(actx, bank, rng, { when, surface: o.surface, gait: o.gait, level: o.level, gear: o.gear });
-      case 'shell': return shellCasing(actx, bank, rng, { when, surface: o.surface, level: o.level, flight: o.flight });
+      case 'shell': {
+        // The casing's arc is scheduling, not synthesis: start the baked bounce
+        // sequence when it lands instead of baking silence for the flight.
+        const flight = o.flight ?? rng.range(0.28, 0.52);
+        const baked = this.voiceBank?.play(actx, `shell:${shellClass(o.surface)}`, rng, when + flight,
+          { level: clamp(o.level ?? 1, 0.1, 2) });
+        return baked ?? shellCasing(actx, bank, rng, { when, surface: o.surface, level: o.level, flight });
+      }
       case 'reload': return reloadPhase(actx, bank, rng, o.phase, { when, heavy: o.heavy });
       case 'explosion': return explosion(actx, bank, rng, { when, distance: dist, radius: o.radius, level: o.level });
       case 'bodyfall': return bodyFall(actx, bank, rng, { when, level: o.level });

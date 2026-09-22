@@ -17,7 +17,7 @@ import { createComposite, createFxaa, createDebug, createViewComposite } from '.
 import { buildFallbackEnvironment } from './env.js';
 import { RenderProbeScene } from './probe.js';
 
-const QUALITY_LEVEL = { low: 0, medium: 1, high: 2, ultra: 3 };
+const QUALITY_LEVEL = { performance: 0, mobile: 0, low: 0, medium: 1, high: 2, ultra: 3 };
 
 /**
  * Registration range at or below which a punctual light counts as a room/street
@@ -189,6 +189,22 @@ export class RenderSystem {
       mapSize: q.shadowMapSize,
       maxDistance: q.shadowDistance,
     });
+    /**
+     * A preset may switch the cascade pass off outright — see `performance`.
+     *
+     * The CSM object stays ALIVE even with shadows off. Its uniforms are baked
+     * into every patched material's program, so tearing it down would mean a
+     * different shader permutation and a recompile of the whole scene the moment
+     * anyone re-enables shadows from the panel. Disabling it skips the pass and
+     * zeroes the strength, which costs nothing and keeps one program set for
+     * both states.
+     */
+    this.shadowsOff = q.shadows === false;
+    if (this.shadowsOff) {
+      this.csm.enabled = false;
+      this.csm.setStrength(0);
+      renderer.shadowMap.enabled = false;
+    }
     this.patcher = new MaterialPatcher(this.csm.uniforms, {
       cascades: this.csm.cascades,
       quality: this.qLevel,
@@ -196,7 +212,13 @@ export class RenderSystem {
 
     this.gbuffer = new GBuffer();
     this._gtao = q.gtao ? new Gtao() : null;
-    this._contact = this.qLevel >= 1 ? new ContactShadows() : null;
+    /**
+     * Contact shadows are FORCED ON when the cascades are off, whatever the
+     * quality level: with the cast shadows gone they are the only thing keeping
+     * objects sitting on the ground, and a short screen-space march is far
+     * cheaper than the pass it replaces.
+     */
+    this._contact = this.qLevel >= 1 || q.contactShadows ? new ContactShadows() : null;
     this._ssr = q.ssr ? new Ssr() : null;
     this._taa = q.taa ? new Taa() : null;
     this._motionBlur = q.motionBlur ? new MotionBlur() : null;
@@ -224,7 +246,7 @@ export class RenderSystem {
      * so instead of offering a dead switch.
      */
     this.opt = {
-      shadows: true,
+      shadows: !this.shadowsOff,
       contact: true,
       gtao: true,
       ssr: true,
@@ -678,9 +700,18 @@ export class RenderSystem {
    * @param {boolean} [opts.post=true]   compile the full-screen pass chain
    * @param {boolean} [opts.shadow]      compile the CSM depth + prepass variants;
    *                                     defaults to true only before frame 1
+   * @param {Function} [opts.beforeJob]  awaited before each post material; the
+   *                                     core pre-warmer uses it to admit at most
+   *                                     one driver-heavy blit per animation frame
+   * @param {AbortSignal} [opts.signal]  best-effort cancellation between jobs
    * @returns {Promise<object>} { ok, ms, programsBefore, programsAfter, compiled }
    */
-  async prewarmMaterials({ post = true, shadow = this.frame === 0 } = {}) {
+  async prewarmMaterials({
+    post = true,
+    shadow = this.frame === 0,
+    beforeJob,
+    signal,
+  } = {}) {
     const t0 = performance.now();
     const renderer = this.renderer;
     const ctx = this.ctx;
@@ -758,18 +789,28 @@ export class RenderSystem {
       //    it is drawn into, so a 4x4 scratch target compiles it for free.
       if (post) {
         const scratch = hdrTarget(4, 4, { name: 'prewarm-scratch' });
-        const mats = [];
-        this._collectPassMaterials(mats);
-        for (const m of mats) {
-          try {
-            blit(renderer, m, scratch);
-          } catch {
-            /* a pass with an unsatisfiable uniform must not stop the rest */
+        try {
+          const mats = [];
+          this._collectPassMaterials(mats);
+          for (let i = 0; i < mats.length; i++) {
+            if (beforeJob) await beforeJob({ phase: 'render-post', index: i, total: mats.length });
+            if (signal?.aborted) {
+              const err = new Error('Shader pre-warm aborted');
+              err.name = 'AbortError';
+              throw err;
+            }
+            try {
+              blit(renderer, mats[i], scratch);
+            } catch {
+              /* a pass with an unsatisfiable uniform must not stop the rest */
+            }
           }
+        } finally {
+          scratch.dispose();
         }
-        scratch.dispose();
       }
     } catch (e) {
+      if (e?.name === 'AbortError' || signal?.aborted) throw e;
       return { ok: false, reason: String(e && e.message ? e.message : e) };
     } finally {
       renderer.setRenderTarget(prevTarget);
@@ -911,7 +952,7 @@ export class RenderSystem {
     const cu = this.composite.uniforms;
     cu.uLens.value.set(s.chromatic, s.vignette, s.grain, 0);
     cu.uGrade.value.set(s.bloomStrength, s.lutStrength, this.taa ? s.sharpen : 0, this.lut.size);
-    this.csm.setStrength(s.shadowStrength);
+    this.csm.setStrength(this.shadowsOff ? 0 : s.shadowStrength);
     if (this.bloom) {
       this.bloom.threshold = s.bloomThreshold;
       this.bloom.knee = s.bloomKnee;

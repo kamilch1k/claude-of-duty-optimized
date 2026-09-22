@@ -58,7 +58,14 @@ const choice = skipMenu
 // Put the loading screen up and let it actually paint before anything blocks:
 // engine.init() holds the main thread, so a frame has to land first or the
 // overlay never appears.
-const loading = skipMenu ? null : showLoading(MAPS.find((m) => m.id === choice.map)?.name ?? choice.map);
+//
+// Shown on the deep-link path too. `?map=` is how every tool, probe and deep
+// link boots, and without an overlay that path is a BLACK SCREEN for the whole
+// build — 12-25 s of nothing, which reads as a hung tab. Not shown for
+// `capture`: the harness compares pixels, and an overlay with a running CSS
+// animation in frame is precisely the nondeterminism baseline.mjs exists to
+// eliminate.
+const loading = capture ? null : showLoading(MAPS.find((m) => m.id === choice.map)?.name ?? choice.map);
 if (loading) {
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 }
@@ -117,41 +124,71 @@ const shotApi = installShotApi(engine, { capture, lockstep });
 // this, 86 programs compile lazily during play, up to 30 on one frame, producing
 // 3.1-3.9 SECOND stalls. See src/core/prewarm.js.
 //
-// ON BY DEFAULT since the capture path was made frame-deterministic; opt out with
-// `?prewarm=0`. It is now PROVEN pixel-neutral: `tools/baseline.mjs` with
-// `--query=prewarm=0` vs `--query=prewarm=1` reports identical:true on all 11
-// shots (0 changed pixels, maxDelta 0). The two things that previously made the
-// ~1.4 s pre-warm spend look like a visual change were both boot-duration
-// couplings OUTSIDE the subsystems: (1) the shutter frame index was latency-bound
-// because the engine kept stepping through the driver's round trips — fixed by
-// lockstep in src/dev/shots.js; (2) `will-change: transform` on the compass strip
-// cached a composited-layer raster taken at a wall-clock-dependent moment — fixed
-// in src/ui/style.js.
-// OFF by default. This was tried both ways and MEASURED both ways.
+// THE OLD CHOICE WAS BETWEEN TWO BAD OUTCOMES, AND NEITHER IS ACCEPTABLE.
 //
-//   prewarm on   boot 48 s, worst in-play frame 69 ms
+//   prewarm on   boot 48 s, worst in-play frame   69 ms
 //   prewarm off  boot  5 s, worst in-play frame 1005 ms
 //
-// The pre-warm does what it claims — it removes the multi-second compile stalls
-// described above — but it costs a flat ~20 s of BLOCKED MAIN THREAD (134
-// programs at ~150 ms each; it is already parallel inside each batch, so that is
-// simply what ANGLE charges for shaders this size). A player does not experience
-// that as a loading screen, they experience it as a dead page: nothing renders,
-// the menu does not respond to clicks, and the tab looks hung.
+// Blocking pre-warm costs a flat ~20 s of held main thread, which a player does
+// not experience as a loading screen but as a dead page: nothing renders, the
+// menu does not answer clicks, the tab looks hung. Skipping it keeps boot fast
+// and moves that cost into gameplay, as the multi-second compile stall the
+// pre-warm exists to remove.
 //
-// One 1-second hitch beats 48 seconds of frozen tab, so the default is a fast
-// boot. `?prewarm=1` buys the stall-free run for anyone profiling or recording.
+// PACED pre-warm removes the trade. It admits one coarse driver job per
+// animation frame, so the work lands behind the composited loading screen while
+// the page stays responsive, and gameplay starts with every permutation already
+// translated by the driver. `transients: 'play'` warms what a player triggers in
+// the first seconds of a fight — the FX bursts, the fire/ADS poses, the combat
+// HUD — measured with tools/fire-programs.mjs to be exactly the set that
+// otherwise compiled on the first trigger pull or the first hit taken.
 //
-// The real fix is neither flag: it is FEWER AND SIMPLER PROGRAMS (206 live, 134
-// pre-warmed), or a pre-warm that runs incrementally across frames once the
-// game is already interactive. Both are bigger than a config change — see
-// CLAUDE_HANDOFF.md.
-const warmup =
-  params.get('prewarm') === '1'
-    ? await prewarm(engine)
-    : { ok: false, reason: 'off by default — ?prewarm=1 to compile everything up front' };
+// The capture harness keeps the old blocking, transient-free order: the pixel
+// gate compares frames, not boot duration, and a deterministically pumped frame
+// count is the whole point of tools/baseline.mjs.
+const prewarmParam = params.get('prewarm');
+const wantPrewarm = prewarmParam === '1' || (prewarmParam !== '0' && !capture);
+const progress = { status: wantPrewarm ? 'running' : 'skipped', progress: 0, map: config.map };
+window.__PREWARM__ = progress;
+
+const warmup = wantPrewarm
+  ? await prewarm(engine, {
+    transients: capture ? false : (params.get('warm') ?? 'play'),
+    paced: !capture,
+    budgetMs: 4,
+    /**
+     * REAL FRAMES, not just compiles.
+     *
+     * `renderer.compileAsync` builds the PROGRAM but touches no buffers: three
+     * uploads a geometry and binds a texture on first DRAW, and the program it
+     * wants can differ from the one compiled because the patcher's key or the
+     * visible light set only settles inside a rendered frame. MEASURED on an
+     * RTX 4080 with compiles alone: `csm-depth` + `ow-prepass` compile for
+     * 218 ms on the first shadowed frame, and one world material plus ten
+     * geometry uploads cost 637 ms at 6.5 s into play — all of it first-draw
+     * work that compiling cannot reach.
+     *
+     * The capture harness keeps this off: it advances subsystem state that core
+     * cannot fully restore, so it is not pixel-neutral, and the gate outranks it.
+     */
+    drawFrames: !capture,
+    shadow: !capture,
+    onProgress: (value) => {
+      progress.progress = value;
+      loading?.setProgress?.(value);
+    },
+  })
+  : { ok: false, reason: `off${capture ? ' for capture' : ''} — ?prewarm=1 to force` };
+Object.assign(progress, warmup, {
+  status: warmup.aborted
+    ? 'aborted'
+    : wantPrewarm
+      ? warmup.ok ? 'done' : 'failed'
+      : 'skipped',
+  progress: warmup.aborted ? progress.progress : 1,
+});
 console.info('[boot] prewarm', warmup);
-window.__PREWARM__ = warmup;
+window.__PREWARM__ = progress;
 
 engine.start();
 loading?.done();

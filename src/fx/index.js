@@ -300,12 +300,55 @@ export class FxSystem {
     const prevMip = renderer.getActiveMipmapLevel?.() ?? 0;
     const rt = new THREE.WebGLRenderTarget(1, 1, { depthBuffer: false, stencilBuffer: false });
     const scratch = (this._warmScene ??= new THREE.Scene());
+    const patcher = this.render?.patcher;
     const compile = (meshes, camera, targetScene) => {
       scratch.children.length = 0;
       for (const m of meshes) if (m) scratch.children.push(m);
       if (!scratch.children.length) return;
+      /**
+       * PATCH BEFORE COMPILING, or this warm compiles a program the game will
+       * never ask for.
+       *
+       * MaterialPatcher wraps `customProgramCacheKey` to return its own key
+       * prepended to the material's. Compiling here from a scratch scene reaches
+       * the material before the real scene walk has patched it, so the warm
+       * builds `fx-decal-1` while the first actual draw asks for
+       * `ow-patch-9-1-0fx-decal-1` — a cache miss, and a driver compile in the
+       * middle of play. Measured with tools/prog-diff.mjs: that was the ONLY
+       * program still compiling during a 30 s session, and on real hardware each
+       * one of these cost 200-1000 ms of frame.
+       *
+       * patch() is idempotent (guarded by its own `_patched` set) and declines
+       * anything unlit, so this matches what the frame walk would do anyway.
+       */
+      if (patcher) {
+        for (const mesh of scratch.children) {
+          const mm = mesh.material;
+          if (Array.isArray(mm)) for (const one of mm) patcher.patch(one);
+          else if (mm) patcher.patch(mm);
+        }
+      }
       try {
         renderer.compile(scratch, camera, targetScene);
+        /**
+         * compile() builds the PROGRAM; it does not upload the maps.
+         *
+         * three's texture counter ticks on first bind for a draw, so these
+         * uploads landed on the first frame that actually emitted a decal —
+         * measured with tools/alloc-diff.mjs as "+1 geo +3 tex, fx-decals" at
+         * frame 8, inside the hitch window rather than during the load screen.
+         * initTexture forces the upload here instead.
+         */
+        for (const mesh of scratch.children) {
+          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+          for (const m of mats) {
+            if (!m) continue;
+            for (const k in m) {
+              const v = m[k];
+              if (v && v.isTexture) renderer.initTexture(v);
+            }
+          }
+        }
       } catch (err) {
         console.warn('[fx] prewarm compile failed', err);
       }
@@ -324,7 +367,25 @@ export class FxSystem {
       }
       // The refraction sprites and the warp pass live in the haze system's own
       // private scenes, which no scene-graph walk from outside can reach.
-      this.hazeSys.prewarm(renderer);
+      // `prevRt` — the target the pipeline had bound before this hook swapped in
+      // its 1x1 scratch — is what the warp pass actually writes to in a frame.
+      this.hazeSys.prewarm(renderer, prevRt);
+
+      /**
+       * Then make the pass actually RUN.
+       *
+       * `renderer.compile()` was not enough: `fx-distort` and `fx-haze-warp`
+       * still built on the first two frames of a held trigger, every run
+       * (tools/fire-stutter.mjs). The warp pass is gated on a live sprite —
+       * `update()` sets `pass.enabled` from the layer's instance count — so with
+       * nothing emitted the pass never executes during boot and its programs
+       * compile the first time a muzzle blast puts a sprite on screen.
+       *
+       * One puff at effectively zero strength fixes that: the pass is live for
+       * the next few frames, compiles while the loading screen is still up, and
+       * distorts by ~1e-4 of a UV, which is invisible.
+       */
+      this.hazeSys.emit(this.now, 0, -9000, 0, 0.05, 1, 0.5, 1e-4, P.SMOKE_A, 0);
     } finally {
       renderer.setRenderTarget(prevRt, prevFace, prevMip);
       rt.dispose();

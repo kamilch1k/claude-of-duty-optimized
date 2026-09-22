@@ -30,7 +30,7 @@ const OPTIC_LABELS = {
   vari: '1-6x',
 };
 
-const PRESETS = ['low', 'medium', 'high', 'ultra'];
+const PRESETS = ['performance', 'low', 'medium', 'high', 'ultra'];
 
 /**
  * The advanced switches, in the order they cost frame time on the web profile.

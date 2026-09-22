@@ -423,12 +423,35 @@ export class WorldSystem {
     try {
       // 1. forward lit pass.
       await this._compile(renderer, scene, camera);
-      // 2. the shadow cascades and 3. the depth/normal/velocity prepass, both of
-      //    which draw this same geometry through an override material.
+      /**
+       * 2. the shadow cascades and 3. the depth/normal/velocity prepass.
+       *
+       * These draw the same geometry through an override material, and the
+       * obvious way to compile them — set `scene.overrideMaterial`, compile —
+       * DOES NOT WORK: three's `WebGLRenderer.compile()` walks `object.material`
+       * and never reads the override, so it re-compiles the material that is
+       * already compiled. This method therefore used to return `compiled: 0`
+       * while the real depth and prepass programs waited for the first frame
+       * that actually drew them. MEASURED on an RTX 4080: `csm-depth` for
+       * 198-218 ms and `ow-prepass` for 394 ms, 1.3-2.4 s into play.
+       *
+       * Swapping the material on every mesh is the only way to reach them
+       * without drawing, and the swap is restored in the same tick.
+       */
       for (const over of [render.csm?.depthMaterial, render.gbuffer?.material]) {
         if (!over) continue;
-        scene.overrideMaterial = over;
-        await this._compile(renderer, scene, camera);
+        const swapped = [];
+        this.root.traverse((o) => {
+          if (!o.isMesh && !o.isPoints && !o.isLine) return;
+          if (!o.material || Array.isArray(o.material)) return;
+          swapped.push([o, o.material]);
+          o.material = over;
+        });
+        try {
+          await this._compile(renderer, scene, camera);
+        } finally {
+          for (const [o, m] of swapped) o.material = m;
+        }
       }
     } finally {
       scene.overrideMaterial = prevOverride;

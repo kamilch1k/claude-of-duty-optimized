@@ -8,6 +8,12 @@ export const PHYSICS_HZ = 120;
 export const FIXED_DT = 1 / PHYSICS_HZ;
 /** Never simulate more than this many physics steps in one frame (spiral-of-death guard). */
 export const MAX_SUBSTEPS = 8;
+/**
+ * Longest frame the simulation will believe, in seconds. Six fixed steps — kept
+ * under MAX_SUBSTEPS on purpose, so catch-up is bounded by this clamp and not by
+ * the backlog-shedding branch. See the note in Engine.step.
+ */
+export const MAX_FRAME_DT = 0.05;
 
 /** Real-world units are metres, seconds, kilograms. */
 export const UNITS = {
@@ -19,6 +25,46 @@ export const UNITS = {
 };
 
 export const QUALITY_PRESETS = {
+  /**
+   * PERFORMANCE — the frame-cost floor, for hardware that is nowhere near a
+   * 4080 and for the first frame a portal player ever sees.
+   *
+   * The one structural difference from `low` is `shadows: false`. The cascade
+   * pass was measured at 326 of the frame's 644 draw calls and 3.0M of its 5.1M
+   * triangles; on a laptop iGPU that is not a line item, it is the frame. Draw
+   * calls matter here even on a fast GPU, because the cost that scales with them
+   * is the JavaScript-side submission of each one, and that is on the main
+   * thread where the input latency lives.
+   *
+   * Contact shadows come ON to replace them. They are the cheap stand-in that
+   * stops everything floating — a short screen-space march resolving the first
+   * 0-40 cm under a crate or a boot — and with the cascades gone they are the
+   * only thing keeping objects on the ground.
+   *
+   * Bloom goes for the same reason: another full-screen chain on a build whose
+   * job is to hold a frame.
+   *
+   * Everything here is still available — `?q=low`, the in-game quality menu, and
+   * the advanced graphics panel can turn shadows back on live without a rebuild.
+   */
+  performance: {
+    renderScale: 0.7,
+    shadows: false,
+    contactShadows: true,
+    shadowMapSize: 512,
+    cascades: 1,
+    shadowDistance: 30,
+    taa: false,
+    gtao: false,
+    ssr: false,
+    volumetrics: false,
+    motionBlur: false,
+    bloom: false,
+    anisotropy: 2,
+    charTextureSize: 256,
+    particleBudget: 1800,
+    decalBudget: 48,
+  },
   low: {
     // Web-first default: keep the scene readable while avoiding the expensive
     // desktop-only effects that make the first frame and steady-state GPU cost

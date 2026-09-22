@@ -223,10 +223,42 @@ export class WeaponSystem {
     this._off.push(ctx.events.on('player:jump', () => this.viewmodel.jump()));
 
     this.stats = { tris, drawCalls: 0, live: 0, fired: 0 };
+    this._warmMagPools();
     console.info(
-      `[weapons] ${this.states.size} weapons · ${(tris / 1000).toFixed(1)}k tris viewmodel · ` +
+      `[weapons] ${this.states.size} weapons A· ${(tris / 1000).toFixed(1)}k tris viewmodel A· ` +
         `built in ${(performance.now() - t0).toFixed(0)}ms`
     );
+  }
+
+  /**
+   * Build the dropped-magazine pools NOW instead of on the first reload.
+   *
+   * `_magProxy` was only ever reached from `_dropMagazine`, so the first reload
+   * of a match constructed ten world-space meshes per weapon and compiled their
+   * WORLD-scene material permutation — the viewmodel's copy of that program is
+   * keyed for the view patch, so it does not satisfy the world draw. MEASURED on
+   * an RTX 4080: a 685-901 ms stall, landing 6-9 s into play, which is exactly
+   * when the first magazine runs dry and is also when a player is most likely to
+   * be moving and shooting.
+   *
+   * The meshes are `THREE.Mesh` instances sharing the viewmodel's geometry and
+   * materials, added invisible, so pre-building them costs a few dozen nodes at
+   * boot and nothing at runtime. The pool is reused rather than allocated on
+   * reload, so behaviour is unchanged.
+   */
+  _warmMagPools() {
+    let built = 0;
+    for (const entry of this.viewmodel.weapons.values()) {
+      if (!entry?.parts?.magazine) continue;
+      if (this._magPools?.has(entry.id)) continue;
+      this._magProxy(entry);
+      built++;
+    }
+    if (built) {
+      // The groups are invisible, but invisible is not the same as un-compiled:
+      // this is what gets their world-scene program into the boot compile set.
+      console.info(`[weapons] warmed ${built} dropped-magazine pools`);
+    }
   }
 
   /* ====================================================================== */

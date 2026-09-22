@@ -157,6 +157,12 @@ export function showLoading(mapName) {
   `);
   document.body.appendChild(root);
   return {
+    /** Fraction 0..1. Purely advisory; the bar also animates on its own. */
+    setProgress(value) {
+      const f = Math.max(0, Math.min(1, Number(value) || 0));
+      const i = root.querySelector('.ow-bar > i');
+      if (i) i.style.setProperty('--p', String(f));
+    },
     done() {
       root.remove();
     },
