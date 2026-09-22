@@ -1,0 +1,264 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>bake — audio</title>
+  </head>
+  <body style="margin: 0; background: #000">
+    <script type="module">
+      /**
+       * Audio bake page.
+       *
+       * There are no sound files upstream either: every shot, footstep and bark
+       * is synthesised through the Web Audio graph at play time. Unity cannot
+       * run that graph, so this renders each event offline and writes a WAV.
+       *
+       * Two decisions worth knowing:
+       *
+       *  - One-shots are baked DRY. No reverb send, no bus compression: Unity
+       *    spatialises and reverbs them itself, and a baked-in tail would fight
+       *    the room it is standing in. The reverb impulses are baked separately,
+       *    as their own files, for Unity's reverb to convolve with.
+       *  - Every take is seeded, so a re-bake reproduces the same sound.
+       */
+      import { Rng } from '/src/core/rng.js';
+      import { NoiseBank } from '/src/audio/dsp.js';
+      import { Mixer } from '/src/audio/mixer.js';
+      import { weaponShot, dryFire, bulletWhizz, WEAPON_PROFILES } from '/src/audio/weapons.js';
+      import {
+        surfaceImpact, footstep, shellCasing, reloadPhase, explosion,
+        bodyFall, uiSound, cloth, heartbeat,
+      } from '/src/audio/foley.js';
+      import { ambientOneShot, ONE_SHOTS } from '/src/audio/ambience.js';
+      import { bark, BARKS } from '/src/audio/vox.js';
+      import { generateIR, IR_SPECS, SPACE_KEYS } from '/src/audio/ir.js';
+
+      const SR = 48000;
+      const IMPACT_SURFACES = [
+        'concrete', 'plaster', 'metal', 'wood', 'dirt', 'sand',
+        'glass', 'water', 'foliage', 'fabric', 'flesh', 'rubber',
+      ];
+      const STEP_SURFACES = IMPACT_SURFACES;
+      const GAITS = ['walk', 'run', 'land'];
+      const UI_KINDS = ['hitmarker', 'headshot', 'kill', 'damage', 'armour', 'grenade_warn', 'regen', 'lowhealth'];
+      const RELOAD_PHASES = ['start', 'magout', 'magin', 'end'];
+
+      function toB64(bytes) {
+        let s = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+          s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(s);
+      }
+
+      /** 16-bit PCM WAV. Nothing in the repo writes audio files, so this is it. */
+      function encodeWav(buffer) {
+        const channels = buffer.numberOfChannels;
+        const frames = buffer.length;
+        const bytes = 44 + frames * channels * 2;
+        const view = new DataView(new ArrayBuffer(bytes));
+        const ascii = (offset, text) => {
+          for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+        };
+        ascii(0, 'RIFF');
+        view.setUint32(4, bytes - 8, true);
+        ascii(8, 'WAVE');
+        ascii(12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, channels, true);
+        view.setUint32(24, buffer.sampleRate, true);
+        view.setUint32(28, buffer.sampleRate * channels * 2, true);
+        view.setUint16(32, channels * 2, true);
+        view.setUint16(34, 16, true);
+        ascii(36, 'data');
+        view.setUint32(40, frames * channels * 2, true);
+        const data = [];
+        for (let c = 0; c < channels; c++) data.push(buffer.getChannelData(c));
+        let offset = 44;
+        for (let i = 0; i < frames; i++) {
+          for (let c = 0; c < channels; c++) {
+            const s = Math.max(-1, Math.min(1, data[c][i]));
+            view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+            offset += 2;
+          }
+        }
+        return toB64(new Uint8Array(view.buffer));
+      }
+
+      /**
+       * The bake list. `seconds` is the offline render length — generous tails,
+       * since a truncated gunshot is the one thing a re-bake cannot fix.
+       */
+      function recipes() {
+        const list = [];
+        for (const profile of Object.keys(WEAPON_PROFILES)) {
+          list.push({
+            name: `weapon_${profile}_1p`,
+            bus: 'weapons',
+            seconds: 2.6,
+            fn: ({ ctx, bank, rng }) => weaponShot(ctx, bank, rng, WEAPON_PROFILES[profile], {
+              when: 0.02, distance: 1.5, firstPerson: true,
+            }),
+          });
+          list.push({
+            name: `weapon_${profile}_3p`,
+            bus: 'weapons',
+            seconds: 2.6,
+            fn: ({ ctx, bank, rng }) => weaponShot(ctx, bank, rng, WEAPON_PROFILES[profile], {
+              when: 0.02, distance: 12, firstPerson: false,
+            }),
+          });
+        }
+        list.push({ name: 'dryfire', bus: 'weapons', seconds: 0.9, fn: ({ ctx, bank, rng }) => dryFire(ctx, bank, rng, { when: 0.02 }) });
+        list.push({ name: 'whizz_near', bus: 'weapons', seconds: 0.9, fn: ({ ctx, bank, rng }) => bulletWhizz(ctx, bank, rng, { when: 0.02, miss: 0.4 }) });
+        list.push({ name: 'whizz_far', bus: 'weapons', seconds: 1.1, fn: ({ ctx, bank, rng }) => bulletWhizz(ctx, bank, rng, { when: 0.02, miss: 3.5 }) });
+
+        for (const surface of IMPACT_SURFACES) {
+          list.push({
+            name: `impact_${surface}`,
+            bus: 'foley',
+            seconds: 1.2,
+            fn: ({ ctx, bank, rng }) => surfaceImpact(ctx, bank, rng, { when: 0.02, surface, energy: 0.8, distance: 3 }),
+          });
+        }
+        for (const surface of STEP_SURFACES) {
+          for (const gait of GAITS) {
+            list.push({
+              name: `step_${surface}_${gait}`,
+              bus: 'foley',
+              seconds: 1.0,
+              fn: ({ ctx, bank, rng }) => footstep(ctx, bank, rng, { when: 0.02, surface, gait, gear: 0.5, distance: 1 }),
+            });
+          }
+        }
+        list.push({ name: 'shell_hard', bus: 'foley', seconds: 1.2, fn: ({ ctx, bank, rng }) => shellCasing(ctx, bank, rng, { when: 0.02, surface: 'concrete', flight: 0.5 }) });
+        list.push({ name: 'shell_soft', bus: 'foley', seconds: 1.2, fn: ({ ctx, bank, rng }) => shellCasing(ctx, bank, rng, { when: 0.02, surface: 'dirt', flight: 0.5 }) });
+        for (const phase of RELOAD_PHASES) {
+          list.push({
+            name: `reload_${phase}`,
+            bus: 'foley',
+            seconds: 1.2,
+            fn: ({ ctx, bank, rng }) => reloadPhase(ctx, bank, rng, phase, { when: 0.02 }),
+          });
+        }
+        list.push({ name: 'explosion', bus: 'weapons', seconds: 3.2, fn: ({ ctx, bank, rng }) => explosion(ctx, bank, rng, { when: 0.02, distance: 8, radius: 6 }) });
+        list.push({ name: 'bodyfall', bus: 'foley', seconds: 1.4, fn: ({ ctx, bank, rng }) => bodyFall(ctx, bank, rng, { when: 0.02 }) });
+        list.push({ name: 'cloth', bus: 'foley', seconds: 0.9, fn: ({ ctx, bank, rng }) => cloth(ctx, bank, rng, { when: 0.02 }) });
+        list.push({ name: 'heartbeat', bus: 'foley', seconds: 2.4, fn: ({ ctx, bank, rng }) => heartbeat(ctx, bank, rng, { when: 0.02 }) });
+
+        for (const kind of UI_KINDS) {
+          list.push({
+            name: `ui_${kind}`,
+            bus: 'ui',
+            seconds: 1.4,
+            fn: ({ ctx, bank, rng }) => uiSound(ctx, bank, rng, kind, { when: 0.02 }),
+          });
+        }
+        for (const kind of ONE_SHOTS) {
+          list.push({
+            name: `amb_${kind}`,
+            bus: 'ambience',
+            seconds: 2.4,
+            fn: ({ ctx, bank, rng }) => ambientOneShot(ctx, bank, rng, kind, { when: 0.02 }),
+          });
+        }
+        for (const key of Object.keys(BARKS)) {
+          list.push({
+            name: `bark_${key}`,
+            bus: 'vox',
+            seconds: 2.2,
+            fn: ({ ctx, bank, rng }) => bark(ctx, bank, rng, { when: 0.02, bark: BARKS[key], f0: 120, tract: 1, level: 1 }),
+          });
+        }
+        return list;
+      }
+
+      /**
+       * A bus must come from the SAME context as the voice: every take gets a
+       * fresh OfflineAudioContext, so caching the bus would hand the next take a
+       * node belonging to a context that has already been rendered and closed.
+       */
+      function busFor(mixer, name) {
+        try {
+          return mixer.bus(name);
+        } catch {
+          return mixer.bus('weapons');
+        }
+      }
+
+      async function bakeOne(recipe, index) {
+        const seconds = recipe.seconds;
+        const ctx = new OfflineAudioContext(1, Math.ceil(SR * seconds), SR);
+        const rng = new Rng(0xb4ce + index * 7919);
+        const bank = new NoiseBank(ctx, rng.fork(), 1.2);
+        const mixer = new Mixer(ctx, rng.fork(), {});
+        const voice = recipe.fn({ ctx, rng, bank, mixer });
+        if (voice?.node) voice.node.connect(busFor(mixer, recipe.bus));
+        const buffer = await ctx.startRendering();
+        return { buffer, seconds };
+      }
+
+      /** Reverb impulses are buffers, not voices: generated, not rendered. */
+      async function bakeIr(space) {
+        const ctx = new OfflineAudioContext(2, 128, SR);
+        const spec = IR_SPECS[space];
+        const buffer = generateIR(ctx, new Rng(0x1234 + space.length), spec);
+        return { buffer, seconds: spec.seconds };
+      }
+
+      /** Peak/RMS, so the baker can prove a file is not silence. */
+      function measure(buffer) {
+        let peak = 0;
+        let sum = 0;
+        let count = 0;
+        for (let c = 0; c < buffer.numberOfChannels; c++) {
+          const d = buffer.getChannelData(c);
+          for (let i = 0; i < d.length; i++) {
+            const v = Math.abs(d[i]);
+            if (v > peak) peak = v;
+            sum += d[i] * d[i];
+            count++;
+          }
+        }
+        return { peak: +peak.toFixed(4), rms: +Math.sqrt(sum / Math.max(count, 1)).toFixed(4) };
+      }
+
+      const LIST = recipes();
+      const IRS = SPACE_KEYS;
+
+      window.__BAKE__ = {
+        list: () => ({
+          oneShots: LIST.map((r) => ({ name: r.name, bus: r.bus, seconds: r.seconds })),
+          irs: IRS,
+        }),
+        bakeOne: async (index) => {
+          const recipe = LIST[index];
+          const { buffer } = await bakeOne(recipe, index);
+          return {
+            name: recipe.name,
+            bus: recipe.bus,
+            seconds: recipe.seconds,
+            sampleRate: buffer.sampleRate,
+            channels: buffer.numberOfChannels,
+            stats: measure(buffer),
+            wav: encodeWav(buffer),
+          };
+        },
+        bakeIr: async (space) => {
+          const { buffer, seconds } = await bakeIr(space);
+          return {
+            name: `ir_${space}`,
+            bus: 'reverb',
+            seconds,
+            sampleRate: buffer.sampleRate,
+            channels: buffer.numberOfChannels,
+            stats: measure(buffer),
+            wav: encodeWav(buffer),
+          };
+        },
+      };
+      window.__READY__ = true;
+    </script>
+  </body>
+</html>
