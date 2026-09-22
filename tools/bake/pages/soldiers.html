@@ -1,0 +1,169 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>bake — soldiers</title>
+  </head>
+  <body style="margin: 0; background: #000">
+    <div id="c"></div>
+    <script type="module">
+      /**
+       * Soldier bake page.
+       *
+       * buildSoldier returns one merged geometry in bind pose with material
+       * groups, so a soldier exports exactly like a weapon — no skinning, no
+       * rig, no animation. The port gets a mannequin that can be placed, shot
+       * and made to fall over; animation is a later pass and the README says so.
+       */
+      import * as THREE from 'three';
+      import { MaterialSystem } from '/src/materials/index.js';
+      import { Rng } from '/src/core/rng.js';
+      import { buildSoldier, VARIANTS, MATERIAL_SLOTS } from '/src/ai/soldier.js';
+      import { SoldierMaterials } from '/src/ai/textures.js';
+
+      const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
+      renderer.setSize(256, 256);
+      document.getElementById('c').appendChild(renderer.domElement);
+
+      const materials = new MaterialSystem({ renderer });
+      await materials.init({ config: { quality: 'ultra', q: { anisotropy: 16 } } });
+
+      /**
+       * The soldier has its own material set — camo, nylon, plate, skin — baked
+       * on the CPU by the AI subsystem, not the world's surfaces. Baking those
+       * textures into Unity materials is its own job, so for now each slot is
+       * mapped onto the closest baked surface with a tint, as a variant key the
+       * Unity importer already knows how to build. Mannequins read correctly;
+       * they do not yet read as cloth.
+       */
+      const SLOT_SURFACE = {
+        camo_arid: 'fabric|scale=0.78,tint=9075294',
+        camo_woodland: 'fabric|scale=0.78,tint=6056778',
+        camo_urban: 'fabric|scale=0.78,tint=7234686',
+        cloth: 'fabric|scale=0.78,tint=7894380',
+        nylon: 'fabric|scale=0.5,tint=3816770',
+        plate: 'metal_painted|scale=0.6,tint=4874053',
+        polymer: 'rubber|scale=0.4,tint=2895408',
+        skin: 'fabric|scale=0.3,tint=11568746',
+        leather: 'rubber|scale=0.4,tint=2762274',
+        boot: 'rubber|scale=0.4,tint=2762274',
+        lens: 'glass|scale=1',
+        glass: 'glass|scale=1',
+      };
+      const surfaceFor = (slot) => SLOT_SURFACE[slot] ?? `fabric|scale=0.8,tint=6710886`;
+
+      function toB64(bytes) {
+        let s = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+          s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(s);
+      }
+
+      const sanitize = (n) => String(n || 'x').replace(/[^A-Za-z0-9_]/g, '_');
+
+      async function bakeSoldier(id) {
+        const soldierMats = new SoldierMaterials(new Rng(0x501d1e4).fork(), {
+          size: 512,
+          anisotropy: 8,
+          camo: ['arid', 'woodland', 'urban'],
+        });
+        const built = buildSoldier(id, { rng: new Rng(0x501d1e4), materials: soldierMats });
+        const geo = built.geometry;
+        const mats = built.materials ?? [];
+        const index = geo.getIndex();
+        const indexArray = index
+          ? index.array
+          : Uint32Array.from({ length: geo.getAttribute('position').count }, (_, i) => i);
+
+        // SoldierMaterials caches by slot name, so identity resolves a slot.
+        const byUuid = new Map();
+        for (const [key, mat] of soldierMats.materials) byUuid.set(mat.uuid, key);
+        for (const [key, mat] of materials._materials) byUuid.set(mat.uuid, key);
+        const keyOf = (slotIndex) => {
+          const m = mats[slotIndex];
+          const slot = (m && byUuid.get(m.uuid)) ?? MATERIAL_SLOTS[slotIndex] ?? m?.name ?? 'cloth';
+          return surfaceFor(slot);
+        };
+
+        const chunks = [];
+        let offset = 0;
+        const push = (typed) => {
+          const bytes = new Uint8Array(typed.buffer, typed.byteOffset, typed.byteLength);
+          const at = offset;
+          chunks.push(bytes);
+          offset += bytes.byteLength;
+          const pad = (4 - (offset % 4)) % 4;
+          if (pad) {
+            chunks.push(new Uint8Array(pad));
+            offset += pad;
+          }
+          return { offset: at, length: bytes.byteLength };
+        };
+
+        const pos = geo.getAttribute('position');
+        const nrm = geo.getAttribute('normal');
+        const col = geo.getAttribute('color');
+
+        // One CODM mesh per material group: the importer turns those into
+        // submeshes, which is how the soldier keeps its slots.
+        const groups = geo.groups?.length
+          ? geo.groups
+          : [{ start: 0, count: indexArray.length, materialIndex: 0 }];
+        const meshes = [];
+        let tris = 0;
+        for (const g of groups) {
+          const count = g.count;
+          const sub = new Uint32Array(count);
+          for (let i = 0; i < count; i++) sub[i] = indexArray[g.start + i];
+          const mesh = {
+            material: keyOf(g.materialIndex),
+            materialIndex: g.materialIndex,
+            vertexCount: pos.count,
+            indexCount: count,
+            tris: count / 3,
+            position: push(pos.array),
+            normal: push(nrm ? nrm.array : pos.array),
+            color: push(col ? col.array : new Float32Array(pos.count * 3).fill(1)),
+            index: push(sub),
+          };
+          tris += mesh.tris;
+          meshes.push(mesh);
+        }
+
+        const total = chunks.reduce((a, c) => a + c.byteLength, 0);
+        const bin = new Uint8Array(total);
+        let at = 0;
+        for (const c of chunks) {
+          bin.set(c, at);
+          at += c.byteLength;
+        }
+
+        return {
+          id,
+          label: id,
+          tris,
+          slots: mats.length,
+          meshes: meshes.length,
+          bytes: total,
+          manifest: {
+            format: 'codm/1',
+            kind: 'soldier',
+            id,
+            label: id,
+            tris,
+            parts: [{ path: 'body', node: 'body', meshes, nodes: [] }],
+            rootNodes: [],
+            specs: { slots: MATERIAL_SLOTS, stats: built.stats ?? null },
+            materialDefs: Object.fromEntries(meshes.map((m) => [m.material, { source: m.material, params: null }])),
+            binBytes: total,
+          },
+          bin: toB64(bin),
+        };
+      }
+
+      window.__BAKE__ = { variants: () => Object.keys(VARIANTS), bakeSoldier };
+      window.__READY__ = true;
+    </script>
+  </body>
+</html>
